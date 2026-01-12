@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS file_content;
+DROP TABLE IF EXISTS dir_entries;
+DROP TABLE IF EXISTS inodes;
