@@ -156,17 +156,17 @@ sudo mount -t vtfs -o token="admin" "http://127.0.0.1:8080" /mnt/vtfs
 
 ## Features
 
-* [x] Mount/unmount filesystem
-* [x] Read-only mount without token
-* [x] Read/write mount with token
-* [x] Create/delete files (`touch`, `rm`, `echo >`)
-* [x] Create/delete directories (`mkdir`, `rmdir`)
-* [x] Read/write files (`cat`, `echo`, `tee`)
-* [x] Hard links (`ln`)
-* [x] Directory listing (`ls`)
-* [x] Persistent storage (survives remount)
-* [x] Multi-client visibility (changes visible across mounts)
-* [x] Backend quota enforcement (`VTFS_MAX_SIZE`)
+* Mount/unmount filesystem
+* Read-only mount without token
+* Read/write mount with token
+* Create/delete files (`touch`, `rm`, `echo >`)
+* Create/delete directories (`mkdir`, `rmdir`)
+* Read/write files (`cat`, `echo`, `tee`)
+* Hard links (`ln`)
+* Directory listing (`ls`)
+* Persistent storage (survives remount)
+* Multi-client visibility (changes visible across mounts)
+* Backend quota enforcement (`VTFS_MAX_SIZE`)
 
 ## API Endpoints
 
