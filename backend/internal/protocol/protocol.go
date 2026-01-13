@@ -113,12 +113,21 @@ func (h *Header) Decode(buf []byte) error {
 type InitRequest struct {
 	Version uint32
 	MaxSize uint32
+	Token   string
 }
 
 func (r *InitRequest) Encode(buf []byte) int {
 	binary.LittleEndian.PutUint32(buf[0:4], r.Version)
 	binary.LittleEndian.PutUint32(buf[4:8], r.MaxSize)
-	return 8
+
+	tok := []byte(r.Token)
+	if len(tok) > MaxNameLen {
+		tok = tok[:MaxNameLen]
+	}
+
+	binary.LittleEndian.PutUint16(buf[8:10], uint16(len(tok)))
+	copy(buf[10:], tok)
+	return 10 + len(tok)
 }
 
 func (r *InitRequest) Decode(buf []byte) error {
@@ -127,6 +136,20 @@ func (r *InitRequest) Decode(buf []byte) error {
 	}
 	r.Version = binary.LittleEndian.Uint32(buf[0:4])
 	r.MaxSize = binary.LittleEndian.Uint32(buf[4:8])
+
+	if len(buf) == 8 {
+		r.Token = ""
+		return nil
+	}
+
+	if len(buf) < 10 {
+		return ErrMsgTooShort
+	}
+	n := int(binary.LittleEndian.Uint16(buf[8:10]))
+	if n < 0 || len(buf) < 10+n {
+		return ErrMsgTooShort
+	}
+	r.Token = string(buf[10 : 10+n])
 	return nil
 }
 

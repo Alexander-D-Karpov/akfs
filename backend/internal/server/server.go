@@ -229,6 +229,12 @@ func (c *Client) sendNotifyEvent(ev *protocol.NotifyEvent) {
 }
 
 func (c *Client) handleMessage(hdr *protocol.Header, payload []byte) {
+	// Must INIT first (except DESTROY)
+	if !c.authenticated && hdr.Opcode != protocol.OpInit && hdr.Opcode != protocol.OpDestroy {
+		c.sendError(hdr, protocol.ErrPerm)
+		return
+	}
+
 	switch hdr.Opcode {
 	case protocol.OpInit:
 		c.handleInit(hdr, payload)
@@ -269,17 +275,28 @@ func (c *Client) handleMessage(hdr *protocol.Header, payload []byte) {
 func (c *Client) handleInit(hdr *protocol.Header, payload []byte) {
 	var req protocol.InitRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d INIT decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d INIT: version=%d maxsize=%d", c.id, req.Version, req.MaxSize)
-
-	c.authenticated = true
-	if req.Version == 0 {
+	// default: allow read-only without token
+	if req.Token == "" {
+		c.authenticated = true
 		c.readOnly = true
-		log.Printf("Client %d is read-only (version=0)", c.id)
+	} else if req.Token != c.server.authToken {
+		// token provided but wrong -> fail mount
+		resp := protocol.InitResponse{
+			Error:   protocol.ErrPerm,
+			Version: protocol.ProtoVersion,
+			MaxSize: protocol.MaxMsgSize,
+		}
+		c.sendResponse(hdr, &resp)
+		c.Close()
+		return
+	} else {
+		// valid token -> RW
+		c.authenticated = true
+		c.readOnly = false
 	}
 
 	resp := protocol.InitResponse{
@@ -287,9 +304,7 @@ func (c *Client) handleInit(hdr *protocol.Header, payload []byte) {
 		Version: protocol.ProtoVersion,
 		MaxSize: protocol.MaxMsgSize,
 	}
-
 	c.sendResponse(hdr, &resp)
-	log.Printf("Client %d INIT complete", c.id)
 }
 
 func (c *Client) handleLookup(hdr *protocol.Header, payload []byte) {

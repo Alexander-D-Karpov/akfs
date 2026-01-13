@@ -20,6 +20,8 @@
 #define VTFS_NONCE_SIZE  12
 #define VTFS_TAG_SIZE    16
 
+#define VTFS_PROTO_VERSION 1
+
 #define VTFS_HEADER_SIZE 24
 #define VTFS_MAX_MSG     (16 * 1024 * 1024)
 

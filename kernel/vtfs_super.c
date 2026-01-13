@@ -188,7 +188,7 @@ int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
     strncpy(sbi->server_host, ctx->host, sizeof(sbi->server_host) - 1);
     sbi->server_port = ctx->port;
 
-    if (ctx->token) {
+    if (ctx->token && ctx->token[0] != '\0') {
         strncpy(sbi->token, ctx->token, sizeof(sbi->token) - 1);
         sbi->readonly = false;
     } else {
