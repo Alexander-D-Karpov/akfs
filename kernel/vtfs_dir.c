@@ -226,6 +226,55 @@ static int vtfs_iterate_shared(struct file *file, struct dir_context *ctx)
     return 0;
 }
 
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int vtfs_rename(struct mnt_idmap *idmap,
+                       struct inode *old_dir, struct dentry *old_dentry,
+                       struct inode *new_dir, struct dentry *new_dentry,
+                       unsigned int flags)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+static int vtfs_rename(struct user_namespace *userns,
+                       struct inode *old_dir, struct dentry *old_dentry,
+                       struct inode *new_dir, struct dentry *new_dentry,
+                       unsigned int flags)
+#else
+static int vtfs_rename(void *unused,
+                       struct inode *old_dir, struct dentry *old_dentry,
+                       struct inode *new_dir, struct dentry *new_dentry,
+                       unsigned int flags)
+#endif
+{
+    struct vtfs_sb_info *sbi = VTFS_SB(old_dir->i_sb);
+    struct vtfs_inode_info *old_dir_vi = VTFS_I(old_dir);
+    struct vtfs_inode_info *new_dir_vi = VTFS_I(new_dir);
+    struct inode *src_inode = d_inode(old_dentry);
+    int ret;
+
+    if (sbi->readonly)
+        return -EROFS;
+
+    if (flags != 0)
+        return -EINVAL;
+
+    ret = vtfs_proto_rename(sbi,
+                            old_dir_vi->backend_ino, old_dentry->d_name.name,
+                            new_dir_vi->backend_ino, new_dentry->d_name.name);
+    if (ret < 0)
+        return ret;
+
+    /* Best-effort local metadata updates; real truth is on server */
+    vtfs_update_time(old_dir);
+    vtfs_update_time(new_dir);
+
+    /* Directory moves across parents adjust link counts */
+    if (src_inode && S_ISDIR(src_inode->i_mode) && old_dir != new_dir) {
+        drop_nlink(old_dir);
+        inc_nlink(new_dir);
+    }
+
+    return 0;
+}
+
 const struct inode_operations vtfs_dir_inode_ops = {
     .lookup = vtfs_lookup,
     .create = vtfs_create,
@@ -233,6 +282,7 @@ const struct inode_operations vtfs_dir_inode_ops = {
     .unlink = vtfs_unlink,
     .rmdir  = vtfs_rmdir,
     .link   = vtfs_link,
+    .rename = vtfs_rename,
 };
 
 const struct file_operations vtfs_dir_ops = {

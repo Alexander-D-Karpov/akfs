@@ -256,6 +256,8 @@ func (c *Client) handleMessage(hdr *protocol.Header, payload []byte) {
 		c.handleRmdir(hdr, payload)
 	case protocol.OpLink:
 		c.handleLink(hdr, payload)
+	case protocol.OpRename:
+		c.handleRename(hdr, payload)
 	case protocol.OpRead:
 		c.handleRead(hdr, payload)
 	case protocol.OpWrite:
@@ -739,6 +741,44 @@ func (c *Client) handleTruncate(hdr *protocol.Header, payload []byte) {
 	}
 
 	resp := protocol.ErrorResponse{Error: protocol.ErrNone}
+	c.sendResponse(hdr, &resp)
+}
+
+func (c *Client) handleRename(hdr *protocol.Header, payload []byte) {
+	if c.readOnly {
+		log.Printf("Client %d RENAME denied (read-only)", c.id)
+		c.sendError(hdr, protocol.ErrRofs)
+		return
+	}
+
+	var req protocol.RenameRequest
+	if err := req.Decode(payload); err != nil {
+		log.Printf("Client %d RENAME decode error: %v", c.id, err)
+		c.sendError(hdr, protocol.ErrProto)
+		return
+	}
+
+	oldParent := hdr.NodeID
+	newParent := req.NewParentIno
+	oldName := req.OldName
+	newName := req.NewName
+
+	log.Printf("Client %d RENAME: oldParent=%d oldName=%q -> newParent=%d newName=%q",
+		c.id, oldParent, oldName, newParent, newName)
+
+	movedIno, err := c.server.storage.Rename(oldParent, oldName, newParent, newName)
+	if err != nil {
+		log.Printf("Client %d RENAME error: %v", c.id, err)
+		c.sendError(hdr, storageErrToProto(err))
+		return
+	}
+
+	// Notify watchers: treat rename as delete+create for now
+	c.server.notify.NotifyDelete(oldParent, movedIno, oldName)
+	c.server.notify.NotifyCreate(newParent, movedIno, newName)
+
+	resp := protocol.ErrorResponse{Error: protocol.ErrNone}
+	log.Printf("Client %d RENAME complete ino=%d", c.id, movedIno)
 	c.sendResponse(hdr, &resp)
 }
 

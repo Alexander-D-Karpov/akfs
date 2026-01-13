@@ -560,3 +560,67 @@ func (r *TruncateRequest) Decode(buf []byte) error {
 	r.Size = binary.LittleEndian.Uint64(buf[0:8])
 	return nil
 }
+
+type RenameRequest struct {
+	NewParentIno uint64
+	OldName      string
+	NewName      string
+}
+
+func (r *RenameRequest) Encode(buf []byte) int {
+	binary.LittleEndian.PutUint64(buf[0:8], r.NewParentIno)
+
+	oldb := []byte(r.OldName)
+	if len(oldb) > MaxNameLen {
+		oldb = oldb[:MaxNameLen]
+	}
+	newb := []byte(r.NewName)
+	if len(newb) > MaxNameLen {
+		newb = newb[:MaxNameLen]
+	}
+
+	off := 8
+	binary.LittleEndian.PutUint16(buf[off:off+2], uint16(len(oldb)))
+	off += 2
+	copy(buf[off:], oldb)
+	off += len(oldb)
+
+	binary.LittleEndian.PutUint16(buf[off:off+2], uint16(len(newb)))
+	off += 2
+	copy(buf[off:], newb)
+	off += len(newb)
+
+	return off
+}
+
+func (r *RenameRequest) Decode(buf []byte) error {
+	if len(buf) < 8+2 {
+		return ErrMsgTooShort
+	}
+
+	r.NewParentIno = binary.LittleEndian.Uint64(buf[0:8])
+	off := 8
+
+	if len(buf) < off+2 {
+		return ErrMsgTooShort
+	}
+	oldN := int(binary.LittleEndian.Uint16(buf[off : off+2]))
+	off += 2
+	if oldN < 0 || oldN > MaxNameLen || len(buf) < off+oldN {
+		return ErrMsgTooShort
+	}
+	r.OldName = string(buf[off : off+oldN])
+	off += oldN
+
+	if len(buf) < off+2 {
+		return ErrMsgTooShort
+	}
+	newN := int(binary.LittleEndian.Uint16(buf[off : off+2]))
+	off += 2
+	if newN < 0 || newN > MaxNameLen || len(buf) < off+newN {
+		return ErrMsgTooShort
+	}
+	r.NewName = string(buf[off : off+newN])
+
+	return nil
+}

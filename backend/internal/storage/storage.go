@@ -944,3 +944,138 @@ func (s *Storage) Truncate(ino uint64, size int64) error {
 	s.flush()
 	return nil
 }
+
+func (s *Storage) Rename(oldParentIno uint64, oldName string, newParentIno uint64, newName string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if oldName == "" || oldName == "." || oldName == ".." || len(oldName) > MaxNameLen {
+		return 0, ErrInvalidName
+	}
+	if newName == "" || newName == "." || newName == ".." || len(newName) > MaxNameLen {
+		return 0, ErrInvalidName
+	}
+
+	oldParent, ok := s.inodes[oldParentIno]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	if !oldParent.IsDir() {
+		return 0, ErrNotDir
+	}
+
+	newParent, ok := s.inodes[newParentIno]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	if !newParent.IsDir() {
+		return 0, ErrNotDir
+	}
+
+	oldEntries, ok := s.dirCache[oldParentIno]
+	if !ok {
+		return 0, ErrNotFound
+	}
+
+	srcIdx := -1
+	var srcIno uint64
+	var srcMode uint32
+	for i, e := range oldEntries {
+		if e.Name == oldName {
+			srcIdx = i
+			srcIno = e.Ino
+			srcMode = e.Mode
+			break
+		}
+	}
+	if srcIdx == -1 {
+		return 0, ErrNotFound
+	}
+
+	srcInode, ok := s.inodes[srcIno]
+	if !ok {
+		return 0, ErrNotFound
+	}
+
+	if oldParentIno == newParentIno && oldName == newName {
+		return srcIno, nil
+	}
+
+	newEntries := s.dirCache[newParentIno]
+	dstIdx := -1
+	var dstIno uint64
+	for i, e := range newEntries {
+		if e.Name == newName {
+			dstIdx = i
+			dstIno = e.Ino
+			break
+		}
+	}
+
+	if dstIdx != -1 {
+		dstInode, ok := s.inodes[dstIno]
+		if !ok {
+			return 0, ErrNotFound
+		}
+
+		if srcInode.IsDir() && !dstInode.IsDir() {
+			return 0, ErrNotDir
+		}
+		if !srcInode.IsDir() && dstInode.IsDir() {
+			return 0, ErrIsDir
+		}
+
+		if dstInode.IsDir() {
+			dstEntries := s.dirCache[dstIno]
+			if len(dstEntries) > 0 {
+				return 0, ErrNotEmpty
+			}
+			delete(s.inodes, dstIno)
+			delete(s.dirCache, dstIno)
+
+			newEntries = append(newEntries[:dstIdx], newEntries[dstIdx+1:]...)
+			s.dirCache[newParentIno] = newEntries
+
+			if newParent.Nlink > 0 {
+				newParent.Nlink--
+			}
+		} else {
+			dstInode.Nlink--
+			if dstInode.Nlink == 0 {
+				delete(s.inodes, dstIno)
+				delete(s.dataCache, dstIno)
+			}
+			newEntries = append(newEntries[:dstIdx], newEntries[dstIdx+1:]...)
+			s.dirCache[newParentIno] = newEntries
+		}
+	}
+
+	oldEntries = append(oldEntries[:srcIdx], oldEntries[srcIdx+1:]...)
+	s.dirCache[oldParentIno] = oldEntries
+
+	entry := domain.DirEntry{
+		Ino:  srcIno,
+		Mode: srcMode,
+		Name: newName,
+	}
+	s.dirCache[newParentIno] = append(s.dirCache[newParentIno], entry)
+
+	now := time.Now()
+
+	if srcInode.IsDir() && oldParentIno != newParentIno {
+		if oldParent.Nlink > 0 {
+			oldParent.Nlink--
+		}
+		newParent.Nlink++
+	}
+
+	oldParent.Mtime, oldParent.Ctime = now, now
+	newParent.Mtime, newParent.Ctime = now, now
+	srcInode.Ctime = now
+
+	if err := s.flush(); err != nil {
+		return 0, err
+	}
+
+	return srcIno, nil
+}

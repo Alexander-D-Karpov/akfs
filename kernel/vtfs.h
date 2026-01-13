@@ -35,6 +35,7 @@
 #define VTFS_OP_UNLINK   0x32
 #define VTFS_OP_RMDIR    0x33
 #define VTFS_OP_LINK     0x34
+#define VTFS_OP_RENAME   0x35
 #define VTFS_OP_READ     0x40
 #define VTFS_OP_WRITE    0x41
 #define VTFS_OP_TRUNCATE 0x42
@@ -139,5 +140,7 @@ ssize_t vtfs_proto_read(struct vtfs_sb_info *sbi, u64 ino, char *buf,
                         size_t len, loff_t offset);
 ssize_t vtfs_proto_write(struct vtfs_sb_info *sbi, u64 ino, const char *buf,
                          size_t len, loff_t offset, loff_t *new_size);
+
+int vtfs_proto_rename(struct vtfs_sb_info *sbi, u64 old_parent_ino, const char *old_name, u64 new_parent_ino, const char *new_name);
 
 #endif

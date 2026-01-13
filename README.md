@@ -164,8 +164,10 @@ Operations:
 - `0x32` UNLINK - Delete file
 - `0x33` RMDIR - Delete directory
 - `0x34` LINK - Create hard link
+- `0x35` RENAME - Rename file/directory
 - `0x40` READ - Read file data
 - `0x41` WRITE - Write file data
+- `0x42` TRUNCATE - Truncate file
 - `0x50` WATCH - Subscribe to directory changes
 - `0x51` UNWATCH - Unsubscribe from directory changes
 - `0x52` NOTIFY - Server notification (async)

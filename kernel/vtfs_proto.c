@@ -485,3 +485,47 @@ int vtfs_proto_truncate(struct vtfs_sb_info *sbi, u64 ino, loff_t size)
     err = (int32_t)get_unaligned_le32(resp);
     return err;
 }
+
+int vtfs_proto_rename(struct vtfs_sb_info *sbi,
+                      u64 old_parent_ino, const char *old_name,
+                      u64 new_parent_ino, const char *new_name)
+{
+    u8 *req;
+    u8 resp[4];
+    size_t old_len, new_len;
+    size_t req_len, resp_len;
+    int ret;
+    int32_t err;
+
+    old_len = strlen(old_name);
+    new_len = strlen(new_name);
+    if (old_len > VTFS_NAME_MAX || new_len > VTFS_NAME_MAX)
+        return -ENAMETOOLONG;
+
+    req_len = 8 + 2 + old_len + 2 + new_len;
+    req = kmalloc(req_len, GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+
+    put_unaligned_le64(new_parent_ino, req);
+
+    put_unaligned_le16((u16)old_len, req + 8);
+    memcpy(req + 10, old_name, old_len);
+
+    put_unaligned_le16((u16)new_len, req + 10 + old_len);
+    memcpy(req + 12 + old_len, new_name, new_len);
+
+    resp_len = sizeof(resp);
+    ret = vtfs_send_request(sbi, VTFS_OP_RENAME, old_parent_ino,
+                            req, req_len, resp, &resp_len);
+    kfree(req);
+
+    if (ret < 0)
+        return ret;
+
+    if (resp_len < 4)
+        return -EIO;
+
+    err = (int32_t)get_unaligned_le32(resp);
+    return err;
+}
