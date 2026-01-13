@@ -38,4 +38,45 @@
     #define VTFS_MKDIR_RET_ERR(e) (e)
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+    #define VTFS_GETATTR_ARGS VTFS_IDMAP_TYPE idmap, const struct path *path, \
+                              struct kstat *stat, u32 request_mask, \
+                              unsigned int query_flags
+    #define VTFS_GETATTR_INODE d_inode(path->dentry)
+#else
+    #define VTFS_GETATTR_ARGS struct vfsmount *mnt, struct dentry *dentry, \
+                              struct kstat *stat
+    #define VTFS_GETATTR_INODE d_inode(dentry)
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+    #define VTFS_USE_PROC_OPS 1
+#endif
+
+/* generic_fillattr changed signature in newer kernels */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#define vtfs_generic_fillattr(idmap, request_mask, inode, stat) \
+    generic_fillattr((idmap), (request_mask), (inode), (stat))
+#else
+#define vtfs_generic_fillattr(idmap, request_mask, inode, stat) \
+    generic_fillattr((idmap), (inode), (stat))
+#endif
+
+
+/* Timestamp helpers */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+    /* Newer kernels: don't assign inode->i_atime/i_mtime directly */
+    #define vtfs_set_time(inode) simple_inode_init_ts(inode)
+    #define vtfs_update_time(inode) \
+        inode_set_mtime_to_ts((inode), inode_set_ctime_current((inode)))
+#else
+    #define vtfs_set_time(inode) do { \
+        (inode)->i_atime = (inode)->i_mtime = (inode)->i_ctime = current_time((inode)); \
+    } while (0)
+
+    #define vtfs_update_time(inode) do { \
+        (inode)->i_mtime = (inode)->i_ctime = current_time((inode)); \
+    } while (0)
+#endif
+
 #endif

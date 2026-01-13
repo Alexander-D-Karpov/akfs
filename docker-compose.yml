@@ -1,53 +1,27 @@
 services:
-  db:
-    image: postgres:16-alpine
-    container_name: akfs_db
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: vtfs
-      POSTGRES_USER: vtfs
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vtfs_secret_password}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./backend/migrations/001_init.up.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vtfs -d vtfs"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    networks:
-      - akfs_internal
-
-  api:
+  vtfs-server:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: akfs_api
-    restart: unless-stopped
-    environment:
-      - DATABASE_URL=postgres://vtfs:${POSTGRES_PASSWORD:-vtfs_secret_password}@db:5432/vtfs?sslmode=disable
-      - PORT=8080
-      - LOG_LEVEL=info
-      - VTFS_TOKEN=${VTFS_TOKEN:-admin}
-      - VTFS_MAX_SIZE=${VTFS_MAX_SIZE:-2147483648}
+    container_name: vtfs-server
     ports:
-      - "8080:8080"
-    depends_on:
-      db:
-        condition: service_healthy
+      - "9000:9000"
+    volumes:
+      - vtfs-data:/var/lib/vtfs
+    environment:
+      - VTFS_LISTEN=0.0.0.0:9000
+      - VTFS_STORAGE=/var/lib/vtfs/data.bin
+      - VTFS_WAL=/var/lib/vtfs/data.wal
+      - VTFS_MAX_SIZE=2147483648
+      - VTFS_TOKEN=admin
+      - VTFS_KEY=default-encryption-key-32bytes!
+      - LOG_LEVEL=info
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "nc", "-z", "localhost", "9000"]
       interval: 10s
       timeout: 5s
       retries: 3
-    networks:
-      - akfs_internal
 
 volumes:
-  postgres_data:
-    driver: local
-
-networks:
-  akfs_internal:
-    driver: bridge
-    internal: false
+  vtfs-data:

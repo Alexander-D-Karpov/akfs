@@ -1,11 +1,11 @@
-MODULE_NAME := vtfs
-$(MODULE_NAME)-objs := vtfs_main.o vtfs_super.o vtfs_inode.o vtfs_dir.o vtfs_file.o http.o
-obj-m := $(MODULE_NAME).o
+obj-m += vtfs.o
+vtfs-objs := vtfs_main.o vtfs_super.o vtfs_inode.o vtfs_dir.o vtfs_file.o \
+             vtfs_net.o vtfs_crypto.o vtfs_proto.o
 
-KVERSION := $(shell uname -r)
-KDIR := /lib/modules/$(KVERSION)/build
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
 
-.PHONY: all clean
+ccflags-y := -DDEBUG -g -Wall
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -13,3 +13,13 @@ all:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f *.o *.ko *.mod.c *.mod *.order *.symvers
+
+install: all
+	sudo insmod vtfs.ko
+
+uninstall:
+	sudo rmmod vtfs || true
+
+reload: uninstall install
+
+.PHONY: all clean install uninstall reload

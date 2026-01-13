@@ -1,72 +1,54 @@
 package main
 
 import (
-	"context"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
-	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Alexander-D-Karpov/akfs/backend/internal/config"
-	handler "github.com/Alexander-D-Karpov/akfs/backend/internal/delivery/http"
-	"github.com/Alexander-D-Karpov/akfs/backend/internal/repository/postgres"
-	"github.com/Alexander-D-Karpov/akfs/backend/internal/usecase"
+	"github.com/Alexander-D-Karpov/akfs/backend/internal/crypto"
+	"github.com/Alexander-D-Karpov/akfs/backend/internal/server"
+	"github.com/Alexander-D-Karpov/akfs/backend/internal/storage"
 )
 
 func main() {
 	cfg := config.Load()
 
-	log.Printf("Starting with token: %s, max size: %d bytes", cfg.AuthToken, cfg.MaxFSSize)
+	log.Printf("AKFS Server starting...")
+	log.Printf("Listen address: %s", cfg.ListenAddr)
+	log.Printf("Storage path: %s", cfg.StoragePath)
+	log.Printf("Max FS size: %d bytes", cfg.MaxFSSize)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
-	cancel()
+	storageDir := filepath.Dir(cfg.StoragePath)
+	if err := os.MkdirAll(storageDir, 0755); err != nil {
+		log.Fatalf("Failed to create storage directory: %v", err)
+	}
+
+	store, err := storage.NewStorage(cfg.StoragePath, cfg.MaxFSSize)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
-	}
-	defer pool.Close()
-
-	if err := pool.Ping(context.Background()); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
-	}
-	log.Println("Connected to database")
-
-	repo := postgres.NewRepository(pool)
-	fsService := usecase.NewFilesystemService(repo)
-	h := handler.NewHandler(fsService, cfg.AuthToken, cfg.MaxFSSize)
-	router := handler.SetupRouter(h)
-
-	server := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      router,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		log.Fatalf("Failed to initialize storage: %v", err)
 	}
 
-	go func() {
-		log.Printf("Server starting on port %s", cfg.Port)
-		if err := server.ListenAndServe(); err != http.ErrServerClosed {
-			log.Fatalf("Server failed: %v", err)
-		}
-	}()
+	key := crypto.DeriveKey(cfg.EncryptKey)
+
+	srv, err := server.NewServer(store, key, cfg.AuthToken, cfg.MaxFSSize)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
+
+	if err := srv.Start(cfg.ListenAddr); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+
+	log.Printf("Server started successfully")
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
 	log.Println("Shutting down server...")
-
-	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("Server shutdown error: %v", err)
-	}
-
+	srv.Stop()
 	log.Println("Server stopped")
 }

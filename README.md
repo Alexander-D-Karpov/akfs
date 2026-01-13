@@ -1,239 +1,259 @@
-# AKFS - AKarpov File System
+# AKFS - Virtual Filesystem with TCP Backend
 
-AKFS is a Linux kernel **virtual filesystem** (kernel module `vtfs`) backed by a **Go HTTP API** with **PostgreSQL** storage.
-
-It supports common file/directory operations, **hard links**, persistence (data survives remounts), and **token-gated write access**:
-- **No token** → mount is **read-only**
-- **Token provided** → mount is **read-write** (backend validates via `X-Auth-Token`)
+A Linux kernel module implementing a virtual filesystem that stores data on a remote server using a custom binary protocol over TCP with AES-GCM encryption.
 
 ## Architecture
+
 ```
-┌───────────────────────────────┐
-│           User space          │
-│   tools: ls, cat, echo, cp    │
-└───────────────┬───────────────┘
-                │ VFS syscalls
-                ▼
-┌───────────────────────────────┐
-│           Linux VFS           │
-│   (superblock, inodes, dentry │
-│    file ops: lookup/read/...) │
-└───────────────┬───────────────┘
-                │ vfs -> vtfs ops
-                ▼
-┌───────────────────────────────┐
-│        VTFS kernel module     │
-│   - implements VFS callbacks  │
-│   - parses mount opts (token) │
-│   - read-only if no token     │
-│   - HTTP client (kernel TCP)  │
-└───────────────┬───────────────┘
-                │ HTTP/JSON
-                ▼
-┌───────────────────────────────┐
-│        Go HTTP API backend    │
-│   endpoints: /api/v1/*        │
-│   - auth via X-Auth-Token     │
-│   - enforces size quota       │
-│   - maps ops -> repository    │
-└───────────────┬───────────────┘
-                │ SQL
-                ▼
-┌───────────────────────────────┐
-│           PostgreSQL          │
-│   tables: inodes, dir_entries │
-│           file_content        │
-└───────────────────────────────┘
-```
++------------------------------------------------------------------------------+
+|                                 Linux Kernel                                 |
++------------------------------------------------------------------------------+
+| VFS                                                                          |
++------------------------------------------------------------------------------+
+| AKFS Kernel FS                                                               |
+|   - Superblock Ops (mount/statfs)                                            |
+|   - Inode Ops (lookup/getattr)                                               |
+|   - File/Dir Ops (readdir/read/write)                                        |
++------------------------------------------------------------------------------+
+| Client Core                                                                  |
+|   - Mount Opts/Auth                                                          |
+|   - RPC Mux (TxnID)                                                          |
+|   - Retry/Timeout                                                            |
+|   - Page Cache/Readahead                                                     |
+|   - Workqueue I/O (async)                                                    |
+|   - Notify Bridge (watch events)                                             |
++------------------------------------------------------------------------------+
+| Transport + Crypto (Kernel)                                                  |
+|   - TCP Socket Client (connect/send/recv)                                    |
+|   - AES-256-GCM (AEAD): nonce mgmt + KDF + header AAD                        |
++------------------------------------------------------------------------------+
 
-## Requirements
+                                       |
+                        TCP/9000 (encrypted frames)
+                                       v
 
-### Backend (Server)
-- Docker + Docker Compose  
-  **OR**
-- Go **1.24+**
-- PostgreSQL **16+**
-
-### Kernel Module (Client VM)
-- Linux kernel 6.x (tested on 6.1, 6.5, 6.8, 6.11)
-- Build tools + headers:
-  - Debian/Ubuntu: `build-essential linux-headers-$(uname -r)`
-
-## Quick Start
-
-### 1) Start the Backend Server
-```bash
-git clone https://github.com/Alexander-D-Karpov/akfs.git
-cd akfs
-
-# Start PostgreSQL + API server
-docker compose up -d --build
-
-# Verify health
-curl http://localhost:8080/health
-````
-
-> Config is read from environment variables. See **Configuration** below.
-
-### 2) Build and Load the Kernel Module (on VM)
-
-```bash
-# Debian/Ubuntu deps
-sudo apt-get update
-sudo apt-get install -y build-essential linux-headers-$(uname -r)
-
-# Build module
-make kernel-build
-
-# Load module
-make kernel-load
-
-# Verify
-lsmod | grep vtfs
-dmesg | tail -20
-```
-
-### 3) Mount the Filesystem
-
-#### Read-only mount (no token)
-
-```bash
-sudo mkdir -p /mnt/vtfs
-sudo mount -t vtfs "http://127.0.0.1:8080" /mnt/vtfs
-```
-
-#### Read-write mount (token required)
-
-```bash
-sudo mkdir -p /mnt/vtfs
-sudo mount -t vtfs -o token="admin" "http://127.0.0.1:8080" /mnt/vtfs
-```
-
-Now try it:
-
-```bash
-cd /mnt/vtfs
-echo "Hello AKFS" | sudo tee hello.txt >/dev/null
-cat hello.txt
-mkdir dir1
-ls -la
-```
-
-### 4) Unmount / Unload
-
-```bash
-make unmount
-make kernel-unload
-```
-
-## Configuration
-
-### Backend environment variables
-
-Used by `docker-compose.yml` (defaults shown):
-
-* `POSTGRES_PASSWORD` (default: `vtfs_secret_password`)
-* `VTFS_TOKEN` (default: `admin`)
-  Token required for **mutating** operations (`create`, `mkdir`, `unlink`, `rmdir`, `write`, `link`)
-* `VTFS_MAX_SIZE` (default: `2147483648`)
-  Maximum total filesystem size in bytes (default ~2 GiB)
-* `PORT` (default: `8080`)
-* `LOG_LEVEL` (default: `info`)
-* `DATABASE_URL` (compose sets it automatically for the `api` container)
-
-You can set these in a project-level `.env` file (not committed) or export them in your shell before running Docker.
-
-### Mount options
-
-* `token=<value>`
-  Enables write access from the kernel module. Without a token, the FS is mounted **read-only** (and VFS operations that modify state will fail with `EROFS`).
-
-Example:
-
-```bash
-sudo mount -t vtfs -o token="admin" "http://127.0.0.1:8080" /mnt/vtfs
++------------------------------------------------------------------------------+
+|                              Go Backend Server                               |
++------------------------------------------------------------------------------+
+| TCP Listener                                                                 |
+|   - Conn Acceptor (per-client goroutine)                                     |
+|   - Session/Auth Manager (token, RO/RW)                                      |
+|   - Notify Hub (watchers)                                                    |
++------------------------------------------------------------------------------+
+| Protocol + Crypto Layer                                                      |
+|   - Frame/Opcode Parser (len/op/flags/txn)                                   |
+|   - AES-256-GCM (AEAD): nonce mgmt + KDF + AAD                               |
++------------------------------------------------------------------------------+
+| Storage Engine                                                               |
+|   - Metadata/Inodes + Directories                                            |
+|   - Page Manager / Allocator                                                 |
+|   - Cache (LRU) + read-through                                               |
+|   - WAL/Journal + crash recovery + writeback/sync                            |
++------------------------------------------------------------------------------+
+| data.bin + WAL (single-file storage)                                         |
++------------------------------------------------------------------------------+
 ```
 
 ## Features
 
-* Mount/unmount filesystem
-* Read-only mount without token
-* Read/write mount with token
-* Create/delete files (`touch`, `rm`, `echo >`)
-* Create/delete directories (`mkdir`, `rmdir`)
-* Read/write files (`cat`, `echo`, `tee`)
-* Hard links (`ln`)
-* Directory listing (`ls`)
-* Persistent storage (survives remount)
-* Multi-client visibility (changes visible across mounts)
-* Backend quota enforcement (`VTFS_MAX_SIZE`)
+- **Binary Protocol**: Custom length-prefixed protocol with little-endian encoding
+- **AES-256-GCM Encryption**: Authenticated encryption for all data in transit
+- **Single-File Storage**: All data stored in a single disk image file
+- **Write-Ahead Logging**: Crash recovery support
+- **LRU Caching**: In-memory cache for improved performance
+- **Directory Watch Notifications**: Real-time updates for watched directories
+- **Multi-client Support**: Multiple simultaneous connections
+- **Kernel 5.12 - 6.11+ Compatibility**: Works across multiple kernel versions
 
-## API Endpoints
+## Requirements
 
-All endpoints are JSON over HTTP. Write operations require header `X-Auth-Token: <VTFS_TOKEN>`.
+### Build Requirements
+- Linux kernel headers (5.12 - 6.11+)
+- Go 1.22+
+- Docker & Docker Compose (optional)
+- GCC, make
 
-| Method | Endpoint         | Description                        |
-| ------ | ---------------- | ---------------------------------- |
-| POST   | `/api/v1/lookup` | Find entry by name                 |
-| POST   | `/api/v1/list`   | List directory contents            |
-| POST   | `/api/v1/create` | Create file *(auth)*               |
-| POST   | `/api/v1/mkdir`  | Create directory *(auth)*          |
-| POST   | `/api/v1/unlink` | Delete file *(auth)*               |
-| POST   | `/api/v1/rmdir`  | Delete directory *(auth)*          |
-| POST   | `/api/v1/read`   | Read file content                  |
-| POST   | `/api/v1/write`  | Write file content *(auth, quota)* |
-| POST   | `/api/v1/link`   | Create hard link *(auth)*          |
-| GET    | `/api/v1/stats`  | FS usage (total/max/available)     |
-| GET    | `/health`        | Health check                       |
+### Runtime Requirements
+- Linux kernel with crypto API support (gcm(aes), sha256)
+- Network connectivity to backend server
 
-## Makefile shortcuts
+## Quick Start
 
-From the repository root:
+### 1. Start the Backend Server
+
+Using Docker:
+```bash
+make run
+```
+
+Or build and run manually:
+```bash
+make build-backend
+VTFS_LISTEN=0.0.0.0:9000 ./backend/bin/vtfs-server
+```
+
+### 2. Build and Load the Kernel Module
 
 ```bash
-make docker-up        # docker compose up -d --build
-make docker-down
-make docker-logs
-
-make kernel-build     # build kernel module in ./kernel
-make kernel-load
-make kernel-unload
-make kernel-reload
-
-make mount            # mounts at /mnt/vtfs using http://localhost:8080 (no token => read-only)
-make unmount
-
-make test             # runs ./scripts/test-fs.sh
-make clean            # kernel-clean + docker-down
+make build-kernel
+sudo insmod kernel/vtfs.ko
 ```
+
+### 3. Mount the Filesystem
+
+Read-write mode (with token):
+```bash
+sudo mkdir -p /mnt/vtfs
+sudo mount -t vtfs none /mnt/vtfs \
+    -o host=127.0.0.1,port=9000,token=admin,key=default-encryption-key-32bytes!
+```
+
+Read-only mode (without token):
+```bash
+sudo mount -t vtfs none /mnt/vtfs \
+    -o host=127.0.0.1,port=9000,key=default-encryption-key-32bytes!
+```
+
+### 4. Run Tests
+
+```bash
+make test
+```
+
+## Mount Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `host` | Backend server IP address | 127.0.0.1 |
+| `port` | Backend server port | 9000 |
+| `token` | Authentication token (enables write access) | (none) |
+| `key` | Encryption key passphrase | default-encryption-key-32bytes! |
+
+## Configuration (Backend Server)
+
+Environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `VTFS_LISTEN` | Listen address | 0.0.0.0:9000 |
+| `VTFS_STORAGE` | Storage file path | /var/lib/vtfs/data.bin |
+| `VTFS_WAL` | WAL file path | /var/lib/vtfs/data.wal |
+| `VTFS_MAX_SIZE` | Maximum filesystem size (bytes) | 2147483648 (2GB) |
+| `VTFS_TOKEN` | Authentication token | admin |
+| `VTFS_KEY` | Encryption key passphrase | default-encryption-key-32bytes! |
+| `LOG_LEVEL` | Log level | info |
+
+## Protocol
+
+Binary protocol with 24-byte header:
+
+```
+┌────────┬────────┬────────┬────────────────┬────────────────┐
+│ Length │ Opcode │ Flags  │     TxnID      │    NodeID      │
+│ 4 bytes│ 2 bytes│ 2 bytes│    8 bytes     │    8 bytes     │
+└────────┴────────┴────────┴────────────────┴────────────────┘
+```
+
+Operations:
+- `0x01` INIT - Initialize connection
+- `0x10` LOOKUP - Lookup file/directory by name
+- `0x11` GETATTR - Get inode attributes
+- `0x20` READDIR - List directory contents
+- `0x30` CREATE - Create file
+- `0x31` MKDIR - Create directory
+- `0x32` UNLINK - Delete file
+- `0x33` RMDIR - Delete directory
+- `0x34` LINK - Create hard link
+- `0x40` READ - Read file data
+- `0x41` WRITE - Write file data
+- `0x50` WATCH - Subscribe to directory changes
+- `0x51` UNWATCH - Unsubscribe from directory changes
+- `0x52` NOTIFY - Server notification (async)
+
+## Storage Format
+
+Single-file storage with page-based layout (4KB pages):
+
+```
+Page 0:     Superblock
+Page 1:     Superblock backup
+Page 2-65:  Inode table (64 pages)
+Page 66+:   Data pages
+```
+
+Inode structure (128 bytes):
+- Inode number (8 bytes)
+- Mode (4 bytes)
+- Nlink (4 bytes)
+- Size (8 bytes)
+- Timestamps (24 bytes)
+- Data page pointers (up to 16)
 
 ## Development
 
-### Run backend locally (without Docker)
+### Project Structure
 
-```bash
-cd backend
-go mod download
-
-export DATABASE_URL="postgres://vtfs:vtfs@localhost:5432/vtfs?sslmode=disable"
-export PORT=8080
-export LOG_LEVEL=info
-export VTFS_TOKEN=admin
-export VTFS_MAX_SIZE=2147483648
-
-go run ./cmd/server
+```
+akfs/
+├── backend/
+│   ├── cmd/server/main.go      # Server entry point
+│   └── internal/
+│       ├── config/             # Configuration
+│       ├── crypto/             # AES-GCM encryption
+│       ├── domain/             # Domain types
+│       ├── protocol/           # Binary protocol
+│       ├── server/             # TCP server & handlers
+│       └── storage/            # Storage engine
+├── kernel/
+│   ├── vtfs.h                  # Main header
+│   ├── vtfs_compat.h           # Kernel compatibility
+│   ├── vtfs_main.c             # Module init/exit
+│   ├── vtfs_super.c            # Superblock operations
+│   ├── vtfs_inode.c            # Inode operations
+│   ├── vtfs_dir.c              # Directory operations
+│   ├── vtfs_file.c             # File operations
+│   ├── vtfs_net.c              # Network layer
+│   ├── vtfs_crypto.c           # Kernel crypto
+│   ├── vtfs_proto.c            # Protocol handling
+│   └── Makefile
+├── scripts/
+│   └── test-fs.sh              # Test script
+├── docker-compose.yml
+├── Makefile
+└── README.md
 ```
 
-### Run tests
+### Building for Different Kernels
 
 ```bash
-# Backend unit tests
-cd backend && go test ./...
+# Build for current kernel
+make build-kernel
 
-# Integration tests (requires backend running and kernel module buildable)
-./scripts/test-fs.sh
+# Build for specific kernel
+make build-kernel KDIR=/usr/src/linux-headers-6.1.0
 ```
+
+## Troubleshooting
+
+### Cannot connect to server
+- Check server is running: `docker-compose logs`
+- Check firewall: `sudo iptables -L`
+- Verify IP/port: `nc -zv 127.0.0.1 9000`
+
+### Module won't load
+- Check kernel version compatibility
+- Check dmesg: `dmesg | tail -20`
+- Verify crypto modules: `lsmod | grep aes`
+
+### Mount fails
+- Check dmesg for errors
+- Verify encryption key matches on both sides
+- Test connection: `nc -zv <host> <port>`
+
+### Permission denied
+- Mount without token = read-only mode
+- Mount with token for write access
 
 ## License
 
-MIT (see `LICENSE`)
+GPL v2

@@ -6,20 +6,24 @@ import (
 )
 
 type Config struct {
-	DatabaseURL string
-	Port        string
-	LogLevel    string
-	AuthToken   string
+	ListenAddr  string
+	StoragePath string
+	WALPath     string
 	MaxFSSize   int64
+	AuthToken   string
+	EncryptKey  string
+	LogLevel    string
 }
 
 func Load() *Config {
 	return &Config{
-		DatabaseURL: getEnv("DATABASE_URL", "postgres://vtfs:vtfs@localhost:5432/vtfs?sslmode=disable"),
-		Port:        getEnv("PORT", "8080"),
-		LogLevel:    getEnv("LOG_LEVEL", "info"),
-		AuthToken:   getEnv("VTFS_TOKEN", "admin"),
+		ListenAddr:  getEnv("VTFS_LISTEN", "0.0.0.0:9000"),
+		StoragePath: getEnv("VTFS_STORAGE", "/var/lib/vtfs/data.bin"),
+		WALPath:     getEnv("VTFS_WAL", "/var/lib/vtfs/data.wal"),
 		MaxFSSize:   getEnvInt64("VTFS_MAX_SIZE", 2*1024*1024*1024),
+		AuthToken:   getEnv("VTFS_TOKEN", "admin"),
+		EncryptKey:  getEnv("VTFS_KEY", "default-encryption-key-32bytes!"),
+		LogLevel:    getEnv("LOG_LEVEL", "info"),
 	}
 }
 
