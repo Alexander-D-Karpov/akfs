@@ -4,19 +4,27 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: vtfs-server
+
+    env_file:
+      - .env
+
     ports:
-      - "9000:9000"
+      - "${VTFS_PORT:-9000}:9000"
+
     volumes:
       - vtfs-data:/var/lib/vtfs
+
     environment:
-      - VTFS_LISTEN=0.0.0.0:9000
-      - VTFS_STORAGE=/var/lib/vtfs/data.bin
-      - VTFS_WAL=/var/lib/vtfs/data.wal
-      - VTFS_MAX_SIZE=2147483648
-      - VTFS_TOKEN=admin
-      - VTFS_KEY=default-encryption-key-32bytes!
-      - LOG_LEVEL=info
+      - VTFS_LISTEN=${VTFS_LISTEN:-0.0.0.0:9000}
+      - VTFS_STORAGE=${VTFS_STORAGE:-/var/lib/vtfs/data.bin}
+      - VTFS_WAL=${VTFS_WAL:-/var/lib/vtfs/data.wal}
+      - VTFS_MAX_SIZE=${VTFS_MAX_SIZE:-2147483648}
+      - VTFS_TOKEN=${VTFS_TOKEN:-admin}
+      - VTFS_KEY=${VTFS_KEY:-default-encryption-key-32bytes!}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+
     restart: unless-stopped
+
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "9000"]
       interval: 10s

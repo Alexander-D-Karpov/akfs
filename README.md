@@ -63,7 +63,7 @@ A Linux kernel module implementing a virtual filesystem that stores data on a re
 - **LRU Caching**: In-memory cache for improved performance
 - **Directory Watch Notifications**: Real-time updates for watched directories
 - **Multi-client Support**: Multiple simultaneous connections
-- **Kernel 5.12 - 6.11+ Compatibility**: Works across multiple kernel versions
+- **Kernel 5.12 - 6.11+ Compatibility**: Works across multiple kernel versions (tested on 6.18.3)
 
 ## Requirements
 
