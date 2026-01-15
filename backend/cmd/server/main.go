@@ -9,6 +9,8 @@ import (
 
 	"github.com/Alexander-D-Karpov/akfs/backend/internal/config"
 	"github.com/Alexander-D-Karpov/akfs/backend/internal/crypto"
+	httpserver "github.com/Alexander-D-Karpov/akfs/backend/internal/http"
+	"github.com/Alexander-D-Karpov/akfs/backend/internal/logger"
 	"github.com/Alexander-D-Karpov/akfs/backend/internal/server"
 	"github.com/Alexander-D-Karpov/akfs/backend/internal/storage"
 )
@@ -16,8 +18,11 @@ import (
 func main() {
 	cfg := config.Load()
 
+	logger.SetLevel(cfg.LogLevel)
+
 	log.Printf("AKFS Server starting...")
 	log.Printf("Listen address: %s", cfg.ListenAddr)
+	log.Printf("HTTP address: %s (enabled: %v)", cfg.HTTPAddr, cfg.EnableHTTP)
 	log.Printf("Storage path: %s", cfg.StoragePath)
 	log.Printf("Max FS size: %d bytes", cfg.MaxFSSize)
 
@@ -42,6 +47,14 @@ func main() {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 
+	var httpSrv *httpserver.HTTPServer
+	if cfg.EnableHTTP {
+		httpSrv = httpserver.NewHTTPServer(store)
+		if err := httpSrv.Start(cfg.HTTPAddr); err != nil {
+			log.Printf("Warning: Failed to start HTTP server: %v", err)
+		}
+	}
+
 	log.Printf("Server started successfully")
 
 	quit := make(chan os.Signal, 1)
@@ -49,6 +62,9 @@ func main() {
 	<-quit
 
 	log.Println("Shutting down server...")
+	if httpSrv != nil {
+		httpSrv.Stop()
+	}
 	srv.Stop()
 	log.Println("Server stopped")
 }

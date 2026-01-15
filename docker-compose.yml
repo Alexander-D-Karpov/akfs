@@ -10,12 +10,15 @@ services:
 
     ports:
       - "${VTFS_PORT:-9000}:9000"
+      - "${VTFS_HTTP_PORT:-8080}:8080"
 
     volumes:
       - vtfs-data:/var/lib/vtfs
 
     environment:
       - VTFS_LISTEN=${VTFS_LISTEN:-0.0.0.0:9000}
+      - VTFS_HTTP=${VTFS_HTTP:-0.0.0.0:8080}
+      - VTFS_HTTP_ENABLE=${VTFS_HTTP_ENABLE:-true}
       - VTFS_STORAGE=${VTFS_STORAGE:-/var/lib/vtfs/data.bin}
       - VTFS_WAL=${VTFS_WAL:-/var/lib/vtfs/data.wal}
       - VTFS_MAX_SIZE=${VTFS_MAX_SIZE:-2147483648}

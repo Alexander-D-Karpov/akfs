@@ -9,19 +9,48 @@
 #include <net/sock.h>
 #include <linux/string.h>
 #include <linux/errno.h>
+#include <linux/delay.h>
 #include "vtfs.h"
 
 #define NET_TIMEOUT_SECS 30
+#define MAX_RECONNECT_ATTEMPTS 3
+#define RECONNECT_DELAY_MS 500
 
-int vtfs_net_connect(struct vtfs_sb_info *sbi)
+static int vtfs_do_connect(struct vtfs_sb_info *sbi);
+static int vtfs_reconnect(struct vtfs_sb_info *sbi);
+static int vtfs_do_init(struct vtfs_sb_info *sbi);
+
+int vtfs_resolve_hostname(const char *hostname, char *ip_buf, size_t ip_buf_len)
+{
+    __be32 addr;
+    int ret;
+
+    ret = in4_pton(hostname, -1, (u8 *)&addr, -1, NULL);
+    if (ret == 1) {
+        strncpy(ip_buf, hostname, ip_buf_len - 1);
+        ip_buf[ip_buf_len - 1] = '\0';
+        return 0;
+    }
+
+    VTFS_ERR("Cannot resolve hostname: %s (provide IP address instead)", hostname);
+    return -EINVAL;
+}
+
+static int vtfs_do_connect(struct vtfs_sb_info *sbi)
 {
     struct sockaddr_in addr;
+    char resolved_ip[64];
     int ret;
 
     if (sbi->sock) {
+        kernel_sock_shutdown(sbi->sock, SHUT_RDWR);
         sock_release(sbi->sock);
         sbi->sock = NULL;
     }
+
+    ret = vtfs_resolve_hostname(sbi->server_host, resolved_ip, sizeof(resolved_ip));
+    if (ret < 0)
+        return ret;
 
     ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sbi->sock);
     if (ret < 0) {
@@ -33,9 +62,9 @@ int vtfs_net_connect(struct vtfs_sb_info *sbi)
     addr.sin_family = AF_INET;
     addr.sin_port = htons(sbi->server_port);
 
-    ret = in4_pton(sbi->server_host, -1, (u8 *)&addr.sin_addr.s_addr, -1, NULL);
+    ret = in4_pton(resolved_ip, -1, (u8 *)&addr.sin_addr.s_addr, -1, NULL);
     if (ret != 1) {
-        VTFS_ERR("Invalid IP address: %s", sbi->server_host);
+        VTFS_ERR("Invalid IP address: %s", resolved_ip);
         sock_release(sbi->sock);
         sbi->sock = NULL;
         return -EINVAL;
@@ -46,7 +75,7 @@ int vtfs_net_connect(struct vtfs_sb_info *sbi)
 
     ret = kernel_connect(sbi->sock, (struct sockaddr *)&addr, sizeof(addr), 0);
     if (ret < 0) {
-        VTFS_ERR("kernel_connect to %s:%d failed: %d", sbi->server_host, sbi->server_port, ret);
+        VTFS_DBG("kernel_connect to %s:%d failed: %d", resolved_ip, sbi->server_port, ret);
         sock_release(sbi->sock);
         sbi->sock = NULL;
         return ret;
@@ -56,94 +85,24 @@ int vtfs_net_connect(struct vtfs_sb_info *sbi)
     return 0;
 }
 
-void vtfs_net_disconnect(struct vtfs_sb_info *sbi)
-{
-    if (sbi->sock) {
-        kernel_sock_shutdown(sbi->sock, SHUT_RDWR);
-        sock_release(sbi->sock);
-        sbi->sock = NULL;
-    }
-}
-
-static int vtfs_net_roundtrip(struct vtfs_sb_info *sbi,
-                              const u8 *req, int req_len,
-                              u8 **out_resp, int *out_resp_len)
-{
-    struct vtfs_msg_header rhdr;
-    u32 total_len, payload_len;
-    u8 *resp;
-    int ret;
-
-    if (!sbi || !req || req_len < VTFS_HEADER_SIZE || !out_resp || !out_resp_len)
-        return -EINVAL;
-
-    *out_resp = NULL;
-    *out_resp_len = 0;
-
-    mutex_lock(&sbi->net_lock);
-
-    ret = vtfs_net_send(sbi, (void *)req, (size_t)req_len);
-    if (ret < 0)
-        goto out_unlock;
-
-    ret = vtfs_net_recv(sbi, &rhdr, VTFS_HEADER_SIZE);
-    if (ret < 0)
-        goto out_unlock;
-
-    total_len = le32_to_cpu(rhdr.length);
-
-    if (total_len < VTFS_HEADER_SIZE || total_len > VTFS_MAX_MSG) {
-        ret = -EPROTO;
-        goto out_unlock;
-    }
-
-    payload_len = total_len - VTFS_HEADER_SIZE;
-
-    resp = kmalloc(total_len, GFP_KERNEL);
-    if (!resp) {
-        ret = -ENOMEM;
-        goto out_unlock;
-    }
-
-    memcpy(resp, &rhdr, VTFS_HEADER_SIZE);
-
-    if (payload_len) {
-        ret = vtfs_net_recv(sbi, resp + VTFS_HEADER_SIZE, payload_len);
-        if (ret < 0) {
-            kfree(resp);
-            goto out_unlock;
-        }
-    }
-
-    *out_resp = resp;
-    *out_resp_len = (int)total_len;
-    ret = 0;
-
-out_unlock:
-    mutex_unlock(&sbi->net_lock);
-    return ret;
-}
-
-int vtfs_net_init(struct vtfs_sb_info *sbi)
+static int vtfs_do_init(struct vtfs_sb_info *sbi)
 {
     struct vtfs_msg_header hdr;
+    struct vtfs_msg_header rhdr;
     u8 *buf = NULL;
     u8 *resp = NULL;
-    int buf_len, resp_len;
+    int buf_len;
     u16 tok_len = 0;
     u8 *p;
     s32 err;
-    u32 srv_ver, srv_max;
+    u32 srv_ver;
+    u32 total_len, payload_len;
     int ret;
-
-    if (!sbi)
-        return -EINVAL;
 
     if (sbi->token[0] != '\0')
         tok_len = (u16)strnlen(sbi->token, VTFS_TOKEN_MAX - 1);
 
     buf_len = VTFS_HEADER_SIZE + 10 + tok_len;
-
     buf = kmalloc(buf_len, GFP_KERNEL);
     if (!buf)
         return -ENOMEM;
@@ -164,31 +123,36 @@ int vtfs_net_init(struct vtfs_sb_info *sbi)
     if (tok_len)
         memcpy(p + 10, sbi->token, tok_len);
 
-    ret = vtfs_net_roundtrip(sbi, buf, buf_len, &resp, &resp_len);
+    ret = vtfs_net_send_raw(sbi, buf, buf_len);
     if (ret < 0)
         goto out;
 
-    if (resp_len < VTFS_HEADER_SIZE + 12) {
+    ret = vtfs_net_recv_raw(sbi, &rhdr, VTFS_HEADER_SIZE);
+    if (ret < 0)
+        goto out;
+
+    total_len = le32_to_cpu(rhdr.length);
+    if (total_len < VTFS_HEADER_SIZE + 12 || total_len > VTFS_MAX_MSG) {
         ret = -EPROTO;
         goto out;
     }
 
-    {
-        struct vtfs_msg_header *rh = (struct vtfs_msg_header *)resp;
-        u16 rop   = le16_to_cpu(rh->opcode);
-        u16 rflag = le16_to_cpu(rh->flags);
-
-        if (rop != VTFS_OP_INIT || !(rflag & VTFS_FLAG_RESPONSE)) {
-            ret = -EPROTO;
-            goto out;
-        }
+    payload_len = total_len - VTFS_HEADER_SIZE;
+    resp = kmalloc(payload_len, GFP_KERNEL);
+    if (!resp) {
+        ret = -ENOMEM;
+        goto out;
     }
 
-    err = (s32)get_unaligned_le32(resp + VTFS_HEADER_SIZE + 0);
-    srv_ver = get_unaligned_le32(resp + VTFS_HEADER_SIZE + 4);
-    srv_max = get_unaligned_le32(resp + VTFS_HEADER_SIZE + 8);
+    ret = vtfs_net_recv_raw(sbi, resp, payload_len);
+    if (ret < 0)
+        goto out;
+
+    err = (s32)get_unaligned_le32(resp + 0);
+    srv_ver = get_unaligned_le32(resp + 4);
 
     if (err) {
+        VTFS_ERR("Server rejected INIT: %d", err);
         ret = err;
         goto out;
     }
@@ -199,7 +163,7 @@ int vtfs_net_init(struct vtfs_sb_info *sbi)
         goto out;
     }
 
-    VTFS_LOG("INIT ok: server_ver=%u server_max=%u", srv_ver, srv_max);
+    VTFS_LOG("INIT successful, protocol version %u", srv_ver);
     ret = 0;
 
 out:
@@ -208,43 +172,95 @@ out:
     return ret;
 }
 
+static int vtfs_reconnect(struct vtfs_sb_info *sbi)
+{
+    int attempt;
+    int ret;
 
+    for (attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
+        if (attempt > 0) {
+            VTFS_LOG("Reconnect attempt %d/%d...", attempt + 1, MAX_RECONNECT_ATTEMPTS);
+            msleep(RECONNECT_DELAY_MS * (1 << attempt));
+        }
 
-int vtfs_net_send(struct vtfs_sb_info *sbi, void *buf, size_t len)
+        ret = vtfs_do_connect(sbi);
+        if (ret < 0)
+            continue;
+
+        ret = vtfs_do_init(sbi);
+        if (ret == 0) {
+            VTFS_LOG("Reconnected successfully");
+            return 0;
+        }
+
+        if (sbi->sock) {
+            kernel_sock_shutdown(sbi->sock, SHUT_RDWR);
+            sock_release(sbi->sock);
+            sbi->sock = NULL;
+        }
+    }
+
+    VTFS_ERR("Failed to reconnect after %d attempts", MAX_RECONNECT_ATTEMPTS);
+    return ret;
+}
+
+int vtfs_net_connect(struct vtfs_sb_info *sbi)
+{
+    return vtfs_do_connect(sbi);
+}
+
+void vtfs_net_disconnect(struct vtfs_sb_info *sbi)
+{
+    if (sbi->sock) {
+        kernel_sock_shutdown(sbi->sock, SHUT_RDWR);
+        sock_release(sbi->sock);
+        sbi->sock = NULL;
+    }
+}
+
+int vtfs_net_init(struct vtfs_sb_info *sbi)
+{
+    int ret;
+
+    ret = vtfs_do_connect(sbi);
+    if (ret < 0)
+        return ret;
+
+    ret = vtfs_do_init(sbi);
+    if (ret < 0) {
+        vtfs_net_disconnect(sbi);
+        return ret;
+    }
+
+    return 0;
+}
+
+int vtfs_net_send_raw(struct vtfs_sb_info *sbi, void *buf, size_t len)
 {
     struct msghdr msg = {0};
     struct kvec iov;
     int ret;
     size_t sent = 0;
 
-    if (!sbi->sock) {
-        ret = vtfs_net_connect(sbi);
-        if (ret < 0)
-            return ret;
-    }
+    if (!sbi->sock)
+        return -ENOTCONN;
 
     while (sent < len) {
         iov.iov_base = (char *)buf + sent;
         iov.iov_len = len - sent;
 
         ret = kernel_sendmsg(sbi->sock, &msg, &iov, 1, iov.iov_len);
-        if (ret < 0) {
-            VTFS_ERR("kernel_sendmsg failed: %d", ret);
-            vtfs_net_disconnect(sbi);
+        if (ret < 0)
             return ret;
-        }
-        if (ret == 0) {
-            VTFS_ERR("kernel_sendmsg returned 0");
-            vtfs_net_disconnect(sbi);
+        if (ret == 0)
             return -EIO;
-        }
         sent += ret;
     }
 
     return 0;
 }
 
-int vtfs_net_recv(struct vtfs_sb_info *sbi, void *buf, size_t len)
+int vtfs_net_recv_raw(struct vtfs_sb_info *sbi, void *buf, size_t len)
 {
     struct msghdr msg = {0};
     struct kvec iov;
@@ -259,17 +275,59 @@ int vtfs_net_recv(struct vtfs_sb_info *sbi, void *buf, size_t len)
         iov.iov_len = len - received;
 
         ret = kernel_recvmsg(sbi->sock, &msg, &iov, 1, iov.iov_len, 0);
-        if (ret < 0) {
-            VTFS_ERR("kernel_recvmsg failed: %d", ret);
-            vtfs_net_disconnect(sbi);
+        if (ret < 0)
             return ret;
-        }
-        if (ret == 0) {
-            VTFS_ERR("Connection closed by server");
-            vtfs_net_disconnect(sbi);
+        if (ret == 0)
             return -ECONNRESET;
-        }
         received += ret;
+    }
+
+    return 0;
+}
+
+int vtfs_net_send(struct vtfs_sb_info *sbi, void *buf, size_t len)
+{
+    int ret;
+    int reconnected = 0;
+
+retry:
+    if (!sbi->sock) {
+        if (reconnected)
+            return -ENOTCONN;
+
+        ret = vtfs_reconnect(sbi);
+        if (ret < 0)
+            return ret;
+        reconnected = 1;
+    }
+
+    ret = vtfs_net_send_raw(sbi, buf, len);
+    if (ret < 0) {
+        VTFS_DBG("Send failed: %d, attempting reconnect", ret);
+        vtfs_net_disconnect(sbi);
+
+        if (!reconnected) {
+            reconnected = 1;
+            goto retry;
+        }
+        return ret;
+    }
+
+    return 0;
+}
+
+int vtfs_net_recv(struct vtfs_sb_info *sbi, void *buf, size_t len)
+{
+    int ret;
+
+    if (!sbi->sock)
+        return -ENOTCONN;
+
+    ret = vtfs_net_recv_raw(sbi, buf, len);
+    if (ret < 0) {
+        VTFS_DBG("Recv failed: %d", ret);
+        vtfs_net_disconnect(sbi);
+        return ret;
     }
 
     return 0;

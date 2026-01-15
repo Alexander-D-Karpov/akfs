@@ -7,6 +7,7 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/net.h>
+#include <linux/workqueue.h>
 #include <crypto/aead.h>
 #include "vtfs_compat.h"
 
@@ -14,7 +15,7 @@
 #define VTFS_ROOT_INO    1
 #define VTFS_NAME_MAX    255
 #define VTFS_BLOCK_SIZE  4096
-#define VTFS_MAX_FILESIZE (100 * 1024 * 1024)
+#define VTFS_MAX_FILESIZE (2ULL * 1024 * 1024 * 1024)
 #define VTFS_TOKEN_MAX   256
 #define VTFS_KEY_SIZE    32
 #define VTFS_NONCE_SIZE  12
@@ -24,6 +25,12 @@
 
 #define VTFS_HEADER_SIZE 24
 #define VTFS_MAX_MSG     (16 * 1024 * 1024)
+
+#define VTFS_READAHEAD_SIZE (1024 * 1024)
+
+#define VTFS_WRITE_CHUNK_SIZE  (256 * 1024)
+#define VTFS_WRITE_PAGES_MAX   1024
+#define VTFS_WRITE_BUF_SIZE    (VTFS_WRITE_PAGES_MAX * PAGE_SIZE)
 
 #define VTFS_OP_INIT     0x01
 #define VTFS_OP_DESTROY  0x02
@@ -51,7 +58,7 @@
 #define VTFS_ERR(fmt, ...) \
     printk(KERN_ERR "[vtfs] ERROR: " fmt "\n", ##__VA_ARGS__)
 #define VTFS_DBG(fmt, ...) \
-    printk(KERN_DEBUG "[vtfs] " fmt "\n", ##__VA_ARGS__)
+    pr_debug("[vtfs] " fmt "\n", ##__VA_ARGS__)
 
 struct vtfs_msg_header {
     __le32 length;
@@ -61,6 +68,30 @@ struct vtfs_msg_header {
     __le64 node_id;
 } __packed;
 
+struct vtfs_write_buffer {
+    struct page **pages;
+    unsigned int nr_pages;
+    unsigned int max_pages;
+    loff_t offset;
+    size_t len;
+};
+
+struct vtfs_file_handle {
+    loff_t ra_offset;
+    size_t ra_len;
+    char *ra_buf;
+    u64 backend_ino;
+
+    struct vtfs_write_buffer wb;
+    spinlock_t wb_lock;
+
+    struct work_struct flush_work;
+    struct vtfs_sb_info *sbi;
+    struct inode *inode;
+    bool flush_pending;
+    int flush_error;
+};
+
 struct vtfs_inode_info {
     struct inode vfs_inode;
     u64 backend_ino;
@@ -68,7 +99,7 @@ struct vtfs_inode_info {
 };
 
 struct vtfs_sb_info {
-    char server_host[128];
+    char server_host[256];
     int server_port;
     char token[VTFS_TOKEN_MAX];
     u8 enc_key[VTFS_KEY_SIZE];
@@ -78,6 +109,8 @@ struct vtfs_sb_info {
     struct socket *sock;
     struct crypto_aead *aead;
     u64 txn_counter;
+    size_t readahead_size;
+    struct workqueue_struct *flush_wq;
 };
 
 static inline struct vtfs_inode_info *VTFS_I(struct inode *inode)
@@ -111,6 +144,9 @@ void vtfs_net_disconnect(struct vtfs_sb_info *sbi);
 int vtfs_net_init(struct vtfs_sb_info *sbi);
 int vtfs_net_send(struct vtfs_sb_info *sbi, void *buf, size_t len);
 int vtfs_net_recv(struct vtfs_sb_info *sbi, void *buf, size_t len);
+int vtfs_net_send_raw(struct vtfs_sb_info *sbi, void *buf, size_t len);
+int vtfs_net_recv_raw(struct vtfs_sb_info *sbi, void *buf, size_t len);
+int vtfs_resolve_hostname(const char *hostname, char *ip_buf, size_t ip_buf_len);
 
 int vtfs_crypto_init(struct vtfs_sb_info *sbi);
 void vtfs_crypto_cleanup(struct vtfs_sb_info *sbi);
@@ -140,7 +176,10 @@ ssize_t vtfs_proto_read(struct vtfs_sb_info *sbi, u64 ino, char *buf,
                         size_t len, loff_t offset);
 ssize_t vtfs_proto_write(struct vtfs_sb_info *sbi, u64 ino, const char *buf,
                          size_t len, loff_t offset, loff_t *new_size);
+ssize_t vtfs_proto_write_chunked(struct vtfs_sb_info *sbi, u64 ino,
+                                  struct vtfs_write_buffer *wb, loff_t *new_size);
 
-int vtfs_proto_rename(struct vtfs_sb_info *sbi, u64 old_parent_ino, const char *old_name, u64 new_parent_ino, const char *new_name);
+int vtfs_proto_rename(struct vtfs_sb_info *sbi, u64 old_parent_ino, const char *old_name,
+                      u64 new_parent_ino, const char *new_name);
 
 #endif

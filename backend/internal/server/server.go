@@ -2,13 +2,13 @@ package server
 
 import (
 	"io"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Alexander-D-Karpov/akfs/backend/internal/crypto"
+	"github.com/Alexander-D-Karpov/akfs/backend/internal/logger"
 	"github.com/Alexander-D-Karpov/akfs/backend/internal/protocol"
 	"github.com/Alexander-D-Karpov/akfs/backend/internal/storage"
 )
@@ -62,7 +62,7 @@ func (s *Server) Start(addr string) error {
 		return err
 	}
 	s.listener = ln
-	log.Printf("Server listening on %s", addr)
+	logger.Info("Server listening on %s", addr)
 
 	s.wg.Add(1)
 	go s.acceptLoop()
@@ -80,13 +80,13 @@ func (s *Server) acceptLoop() {
 			case <-s.quit:
 				return
 			default:
-				log.Printf("Accept error: %v", err)
+				logger.Error("Accept error: %v", err)
 				continue
 			}
 		}
 
 		clientID := atomic.AddUint64(&s.nextClientID, 1)
-		log.Printf("Client %d connected from %s", clientID, conn.RemoteAddr())
+		logger.Info("Client %d connected from %s", clientID, conn.RemoteAddr())
 
 		client := &Client{
 			id:         clientID,
@@ -123,6 +123,10 @@ func (s *Server) Stop() {
 	s.storage.Close()
 }
 
+func (s *Server) Storage() *storage.Storage {
+	return s.storage
+}
+
 func (c *Client) readLoop() {
 	defer func() {
 		c.server.wg.Done()
@@ -143,24 +147,24 @@ func (c *Client) readLoop() {
 		n, err := io.ReadFull(c.conn, headerBuf)
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("Client %d read header error (read %d bytes): %v", c.id, n, err)
+				logger.Debug("Client %d read header error (read %d bytes): %v", c.id, n, err)
 			} else {
-				log.Printf("Client %d disconnected", c.id)
+				logger.Info("Client %d disconnected", c.id)
 			}
 			return
 		}
 
 		var hdr protocol.Header
 		if err := hdr.Decode(headerBuf); err != nil {
-			log.Printf("Client %d decode header error: %v", c.id, err)
+			logger.Error("Client %d decode header error: %v", c.id, err)
 			return
 		}
 
-		log.Printf("Client %d received: op=0x%02x len=%d txn=%d node=%d",
+		logger.Debug("Client %d received: op=0x%02x len=%d txn=%d node=%d",
 			c.id, hdr.Opcode, hdr.Length, hdr.TxnID, hdr.NodeID)
 
 		if hdr.Length > protocol.MaxMsgSize {
-			log.Printf("Client %d message too large: %d", c.id, hdr.Length)
+			logger.Error("Client %d message too large: %d", c.id, hdr.Length)
 			return
 		}
 
@@ -170,7 +174,7 @@ func (c *Client) readLoop() {
 			payload = make([]byte, payloadLen)
 			n, err = io.ReadFull(c.conn, payload)
 			if err != nil {
-				log.Printf("Client %d read payload error (read %d/%d bytes): %v", c.id, n, payloadLen, err)
+				logger.Error("Client %d read payload error (read %d/%d bytes): %v", c.id, n, payloadLen, err)
 				return
 			}
 		}
@@ -178,7 +182,7 @@ func (c *Client) readLoop() {
 		if (hdr.Flags & protocol.FlagEncrypted) != 0 {
 			decrypted, err := c.crypto.Decrypt(payload)
 			if err != nil {
-				log.Printf("Client %d decrypt error: %v", c.id, err)
+				logger.Error("Client %d decrypt error: %v", c.id, err)
 				c.sendError(&hdr, protocol.ErrProto)
 				continue
 			}
@@ -229,7 +233,6 @@ func (c *Client) sendNotifyEvent(ev *protocol.NotifyEvent) {
 }
 
 func (c *Client) handleMessage(hdr *protocol.Header, payload []byte) {
-	// Must INIT first (except DESTROY)
 	if !c.authenticated && hdr.Opcode != protocol.OpInit && hdr.Opcode != protocol.OpDestroy {
 		c.sendError(hdr, protocol.ErrPerm)
 		return
@@ -269,7 +272,7 @@ func (c *Client) handleMessage(hdr *protocol.Header, payload []byte) {
 	case protocol.OpTruncate:
 		c.handleTruncate(hdr, payload)
 	default:
-		log.Printf("Client %d unknown opcode: 0x%02x", c.id, hdr.Opcode)
+		logger.Warn("Client %d unknown opcode: 0x%02x", c.id, hdr.Opcode)
 		c.sendError(hdr, protocol.ErrInval)
 	}
 }
@@ -281,12 +284,10 @@ func (c *Client) handleInit(hdr *protocol.Header, payload []byte) {
 		return
 	}
 
-	// default: allow read-only without token
 	if req.Token == "" {
 		c.authenticated = true
 		c.readOnly = true
 	} else if req.Token != c.server.authToken {
-		// token provided but wrong -> fail mount
 		resp := protocol.InitResponse{
 			Error:   protocol.ErrPerm,
 			Version: protocol.ProtoVersion,
@@ -296,7 +297,6 @@ func (c *Client) handleInit(hdr *protocol.Header, payload []byte) {
 		c.Close()
 		return
 	} else {
-		// valid token -> RW
 		c.authenticated = true
 		c.readOnly = false
 	}
@@ -312,16 +312,16 @@ func (c *Client) handleInit(hdr *protocol.Header, payload []byte) {
 func (c *Client) handleLookup(hdr *protocol.Header, payload []byte) {
 	var req protocol.LookupRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d LOOKUP decode error: %v", c.id, err)
+		logger.Debug("Client %d LOOKUP decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d LOOKUP: parent=%d name=%q", c.id, hdr.NodeID, req.Name)
+	logger.Debug("Client %d LOOKUP: parent=%d name=%q", c.id, hdr.NodeID, req.Name)
 
 	inode, err := c.server.storage.Lookup(hdr.NodeID, req.Name)
 	if err != nil {
-		log.Printf("Client %d LOOKUP error: %v", c.id, err)
+		logger.Debug("Client %d LOOKUP error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
@@ -337,16 +337,16 @@ func (c *Client) handleLookup(hdr *protocol.Header, payload []byte) {
 		Ctime: uint64(inode.Ctime.Unix()),
 	}
 
-	log.Printf("Client %d LOOKUP result: ino=%d mode=0%o size=%d", c.id, inode.Ino, inode.Mode, inode.Size)
+	logger.Debug("Client %d LOOKUP result: ino=%d mode=0%o size=%d", c.id, inode.Ino, inode.Mode, inode.Size)
 	c.sendResponse(hdr, &resp)
 }
 
 func (c *Client) handleGetattr(hdr *protocol.Header, payload []byte) {
-	log.Printf("Client %d GETATTR: ino=%d", c.id, hdr.NodeID)
+	logger.Debug("Client %d GETATTR: ino=%d", c.id, hdr.NodeID)
 
 	inode, err := c.server.storage.GetInode(hdr.NodeID)
 	if err != nil {
-		log.Printf("Client %d GETATTR error: %v", c.id, err)
+		logger.Debug("Client %d GETATTR error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
@@ -362,23 +362,23 @@ func (c *Client) handleGetattr(hdr *protocol.Header, payload []byte) {
 		Ctime: uint64(inode.Ctime.Unix()),
 	}
 
-	log.Printf("Client %d GETATTR result: mode=0%o size=%d nlink=%d", c.id, inode.Mode, inode.Size, inode.Nlink)
+	logger.Debug("Client %d GETATTR result: mode=0%o size=%d nlink=%d", c.id, inode.Mode, inode.Size, inode.Nlink)
 	c.sendResponse(hdr, &resp)
 }
 
 func (c *Client) handleReaddir(hdr *protocol.Header, payload []byte) {
 	var req protocol.ReaddirRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d READDIR decode error: %v", c.id, err)
+		logger.Debug("Client %d READDIR decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d READDIR: ino=%d offset=%d count=%d", c.id, hdr.NodeID, req.Offset, req.Count)
+	logger.Debug("Client %d READDIR: ino=%d offset=%d count=%d", c.id, hdr.NodeID, req.Offset, req.Count)
 
 	entries, err := c.server.storage.List(hdr.NodeID)
 	if err != nil {
-		log.Printf("Client %d READDIR error: %v", c.id, err)
+		logger.Debug("Client %d READDIR error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
@@ -397,29 +397,29 @@ func (c *Client) handleReaddir(hdr *protocol.Header, payload []byte) {
 		Entries: protoEntries,
 	}
 
-	log.Printf("Client %d READDIR result: %d entries", c.id, len(entries))
+	logger.Debug("Client %d READDIR result: %d entries", c.id, len(entries))
 	c.sendResponse(hdr, &resp)
 }
 
 func (c *Client) handleCreate(hdr *protocol.Header, payload []byte) {
 	if c.readOnly {
-		log.Printf("Client %d CREATE denied (read-only)", c.id)
+		logger.Debug("Client %d CREATE denied (read-only)", c.id)
 		c.sendError(hdr, protocol.ErrRofs)
 		return
 	}
 
 	var req protocol.CreateRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d CREATE decode error: %v", c.id, err)
+		logger.Debug("Client %d CREATE decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d CREATE: parent=%d name=%q mode=0%o", c.id, hdr.NodeID, req.Name, req.Mode)
+	logger.Debug("Client %d CREATE: parent=%d name=%q mode=0%o", c.id, hdr.NodeID, req.Name, req.Mode)
 
 	inode, err := c.server.storage.Create(hdr.NodeID, req.Name, req.Mode)
 	if err != nil {
-		log.Printf("Client %d CREATE error: %v", c.id, err)
+		logger.Debug("Client %d CREATE error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
@@ -437,29 +437,29 @@ func (c *Client) handleCreate(hdr *protocol.Header, payload []byte) {
 		Ctime: uint64(inode.Ctime.Unix()),
 	}
 
-	log.Printf("Client %d CREATE result: ino=%d", c.id, inode.Ino)
+	logger.Debug("Client %d CREATE result: ino=%d", c.id, inode.Ino)
 	c.sendResponse(hdr, &resp)
 }
 
 func (c *Client) handleMkdir(hdr *protocol.Header, payload []byte) {
 	if c.readOnly {
-		log.Printf("Client %d MKDIR denied (read-only)", c.id)
+		logger.Debug("Client %d MKDIR denied (read-only)", c.id)
 		c.sendError(hdr, protocol.ErrRofs)
 		return
 	}
 
 	var req protocol.CreateRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d MKDIR decode error: %v", c.id, err)
+		logger.Debug("Client %d MKDIR decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d MKDIR: parent=%d name=%q mode=0%o", c.id, hdr.NodeID, req.Name, req.Mode)
+	logger.Debug("Client %d MKDIR: parent=%d name=%q mode=0%o", c.id, hdr.NodeID, req.Name, req.Mode)
 
 	inode, err := c.server.storage.Mkdir(hdr.NodeID, req.Name, req.Mode)
 	if err != nil {
-		log.Printf("Client %d MKDIR error: %v", c.id, err)
+		logger.Debug("Client %d MKDIR error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
@@ -477,25 +477,25 @@ func (c *Client) handleMkdir(hdr *protocol.Header, payload []byte) {
 		Ctime: uint64(inode.Ctime.Unix()),
 	}
 
-	log.Printf("Client %d MKDIR result: ino=%d", c.id, inode.Ino)
+	logger.Debug("Client %d MKDIR result: ino=%d", c.id, inode.Ino)
 	c.sendResponse(hdr, &resp)
 }
 
 func (c *Client) handleUnlink(hdr *protocol.Header, payload []byte) {
 	if c.readOnly {
-		log.Printf("Client %d UNLINK denied (read-only)", c.id)
+		logger.Debug("Client %d UNLINK denied (read-only)", c.id)
 		c.sendError(hdr, protocol.ErrRofs)
 		return
 	}
 
 	var req protocol.UnlinkRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d UNLINK decode error: %v", c.id, err)
+		logger.Debug("Client %d UNLINK decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d UNLINK: parent=%d name=%q", c.id, hdr.NodeID, req.Name)
+	logger.Debug("Client %d UNLINK: parent=%d name=%q", c.id, hdr.NodeID, req.Name)
 
 	inode, _ := c.server.storage.Lookup(hdr.NodeID, req.Name)
 	var deletedIno uint64
@@ -504,7 +504,7 @@ func (c *Client) handleUnlink(hdr *protocol.Header, payload []byte) {
 	}
 
 	if err := c.server.storage.Unlink(hdr.NodeID, req.Name); err != nil {
-		log.Printf("Client %d UNLINK error: %v", c.id, err)
+		logger.Debug("Client %d UNLINK error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
@@ -512,25 +512,25 @@ func (c *Client) handleUnlink(hdr *protocol.Header, payload []byte) {
 	c.server.notify.NotifyDelete(hdr.NodeID, deletedIno, req.Name)
 
 	resp := protocol.ErrorResponse{Error: protocol.ErrNone}
-	log.Printf("Client %d UNLINK complete", c.id)
+	logger.Debug("Client %d UNLINK complete", c.id)
 	c.sendResponse(hdr, &resp)
 }
 
 func (c *Client) handleRmdir(hdr *protocol.Header, payload []byte) {
 	if c.readOnly {
-		log.Printf("Client %d RMDIR denied (read-only)", c.id)
+		logger.Debug("Client %d RMDIR denied (read-only)", c.id)
 		c.sendError(hdr, protocol.ErrRofs)
 		return
 	}
 
 	var req protocol.UnlinkRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d RMDIR decode error: %v", c.id, err)
+		logger.Debug("Client %d RMDIR decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d RMDIR: parent=%d name=%q", c.id, hdr.NodeID, req.Name)
+	logger.Debug("Client %d RMDIR: parent=%d name=%q", c.id, hdr.NodeID, req.Name)
 
 	inode, _ := c.server.storage.Lookup(hdr.NodeID, req.Name)
 	var deletedIno uint64
@@ -539,7 +539,7 @@ func (c *Client) handleRmdir(hdr *protocol.Header, payload []byte) {
 	}
 
 	if err := c.server.storage.Rmdir(hdr.NodeID, req.Name); err != nil {
-		log.Printf("Client %d RMDIR error: %v", c.id, err)
+		logger.Debug("Client %d RMDIR error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
@@ -547,28 +547,28 @@ func (c *Client) handleRmdir(hdr *protocol.Header, payload []byte) {
 	c.server.notify.NotifyDelete(hdr.NodeID, deletedIno, req.Name)
 
 	resp := protocol.ErrorResponse{Error: protocol.ErrNone}
-	log.Printf("Client %d RMDIR complete", c.id)
+	logger.Debug("Client %d RMDIR complete", c.id)
 	c.sendResponse(hdr, &resp)
 }
 
 func (c *Client) handleLink(hdr *protocol.Header, payload []byte) {
 	if c.readOnly {
-		log.Printf("Client %d LINK denied (read-only)", c.id)
+		logger.Debug("Client %d LINK denied (read-only)", c.id)
 		c.sendError(hdr, protocol.ErrRofs)
 		return
 	}
 
 	var req protocol.LinkRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d LINK decode error: %v", c.id, err)
+		logger.Debug("Client %d LINK decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d LINK: ino=%d newparent=%d newname=%q", c.id, hdr.NodeID, req.NewParentIno, req.NewName)
+	logger.Debug("Client %d LINK: ino=%d newparent=%d newname=%q", c.id, hdr.NodeID, req.NewParentIno, req.NewName)
 
 	if err := c.server.storage.Link(hdr.NodeID, req.NewParentIno, req.NewName); err != nil {
-		log.Printf("Client %d LINK error: %v", c.id, err)
+		logger.Debug("Client %d LINK error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
@@ -576,23 +576,23 @@ func (c *Client) handleLink(hdr *protocol.Header, payload []byte) {
 	c.server.notify.NotifyCreate(req.NewParentIno, hdr.NodeID, req.NewName)
 
 	resp := protocol.ErrorResponse{Error: protocol.ErrNone}
-	log.Printf("Client %d LINK complete", c.id)
+	logger.Debug("Client %d LINK complete", c.id)
 	c.sendResponse(hdr, &resp)
 }
 
 func (c *Client) handleRead(hdr *protocol.Header, payload []byte) {
 	var req protocol.ReadRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d READ decode error: %v", c.id, err)
+		logger.Debug("Client %d READ decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d READ: ino=%d offset=%d size=%d", c.id, hdr.NodeID, req.Offset, req.Size)
+	logger.Debug("Client %d READ: ino=%d offset=%d size=%d", c.id, hdr.NodeID, req.Offset, req.Size)
 
 	data, err := c.server.storage.Read(hdr.NodeID, int64(req.Offset), int64(req.Size))
 	if err != nil {
-		log.Printf("Client %d READ error: %v", c.id, err)
+		logger.Debug("Client %d READ error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
@@ -602,36 +602,36 @@ func (c *Client) handleRead(hdr *protocol.Header, payload []byte) {
 		Data:  data,
 	}
 
-	log.Printf("Client %d READ result: %d bytes", c.id, len(data))
+	logger.Debug("Client %d READ result: %d bytes", c.id, len(data))
 	c.sendResponse(hdr, &resp)
 }
 
 func (c *Client) handleWrite(hdr *protocol.Header, payload []byte) {
 	if c.readOnly {
-		log.Printf("Client %d WRITE denied (read-only)", c.id)
+		logger.Debug("Client %d WRITE denied (read-only)", c.id)
 		c.sendError(hdr, protocol.ErrRofs)
 		return
 	}
 
 	var req protocol.WriteRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d WRITE decode error: %v", c.id, err)
+		logger.Debug("Client %d WRITE decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d WRITE: ino=%d offset=%d size=%d", c.id, hdr.NodeID, req.Offset, len(req.Data))
+	logger.Debug("Client %d WRITE: ino=%d offset=%d size=%d", c.id, hdr.NodeID, req.Offset, len(req.Data))
 
 	currentSize := c.server.storage.GetTotalSize()
 	if currentSize+int64(len(req.Data)) > c.server.maxSize {
-		log.Printf("Client %d WRITE error: no space", c.id)
+		logger.Debug("Client %d WRITE error: no space", c.id)
 		c.sendError(hdr, protocol.ErrNospc)
 		return
 	}
 
 	written, newSize, err := c.server.storage.Write(hdr.NodeID, int64(req.Offset), req.Data)
 	if err != nil {
-		log.Printf("Client %d WRITE error: %v", c.id, err)
+		logger.Debug("Client %d WRITE error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
@@ -642,19 +642,19 @@ func (c *Client) handleWrite(hdr *protocol.Header, payload []byte) {
 		NewSize: uint64(newSize),
 	}
 
-	log.Printf("Client %d WRITE result: written=%d newsize=%d", c.id, written, newSize)
+	logger.Debug("Client %d WRITE result: written=%d newsize=%d", c.id, written, newSize)
 	c.sendResponse(hdr, &resp)
 }
 
 func (c *Client) handleWatch(hdr *protocol.Header, payload []byte) {
 	var req protocol.WatchRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d WATCH decode error: %v", c.id, err)
+		logger.Debug("Client %d WATCH decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
 
-	log.Printf("Client %d WATCH: ino=%d events=0x%x", c.id, hdr.NodeID, req.Events)
+	logger.Debug("Client %d WATCH: ino=%d events=0x%x", c.id, hdr.NodeID, req.Events)
 
 	c.server.notify.Subscribe(c.id, hdr.NodeID, req.Events)
 
@@ -663,7 +663,7 @@ func (c *Client) handleWatch(hdr *protocol.Header, payload []byte) {
 }
 
 func (c *Client) handleUnwatch(hdr *protocol.Header, payload []byte) {
-	log.Printf("Client %d UNWATCH: ino=%d", c.id, hdr.NodeID)
+	logger.Debug("Client %d UNWATCH: ino=%d", c.id, hdr.NodeID)
 
 	c.server.notify.Unsubscribe(c.id, hdr.NodeID)
 
@@ -694,14 +694,14 @@ func (c *Client) sendResponse(reqHdr *protocol.Header, resp encoder) {
 	c.mu.Unlock()
 
 	if err != nil {
-		log.Printf("Client %d send response error: %v", c.id, err)
+		logger.Error("Client %d send response error: %v", c.id, err)
 	} else {
-		log.Printf("Client %d sent response: op=0x%02x len=%d", c.id, hdr.Opcode, n)
+		logger.Debug("Client %d sent response: op=0x%02x len=%d", c.id, hdr.Opcode, n)
 	}
 }
 
 func (c *Client) sendError(reqHdr *protocol.Header, errCode int32) {
-	log.Printf("Client %d sending error: %d", c.id, errCode)
+	logger.Debug("Client %d sending error: %d", c.id, errCode)
 	resp := protocol.ErrorResponse{Error: errCode}
 	c.sendResponse(reqHdr, &resp)
 }
@@ -712,7 +712,7 @@ func (c *Client) Close() {
 }
 
 func (c *Client) cleanup() {
-	log.Printf("Client %d cleanup", c.id)
+	logger.Info("Client %d cleanup", c.id)
 	c.server.notify.UnregisterClient(c.id)
 
 	c.server.clientsMu.Lock()
@@ -722,7 +722,7 @@ func (c *Client) cleanup() {
 
 func (c *Client) handleTruncate(hdr *protocol.Header, payload []byte) {
 	if c.readOnly {
-		log.Printf("Client %d TRUNCATE denied (read-only)", c.id)
+		logger.Debug("Client %d TRUNCATE denied (read-only)", c.id)
 		c.sendError(hdr, protocol.ErrRofs)
 		return
 	}
@@ -733,7 +733,7 @@ func (c *Client) handleTruncate(hdr *protocol.Header, payload []byte) {
 		return
 	}
 
-	log.Printf("Client %d TRUNCATE: ino=%d size=%d", c.id, hdr.NodeID, req.Size)
+	logger.Debug("Client %d TRUNCATE: ino=%d size=%d", c.id, hdr.NodeID, req.Size)
 
 	if err := c.server.storage.Truncate(hdr.NodeID, int64(req.Size)); err != nil {
 		c.sendError(hdr, storageErrToProto(err))
@@ -746,14 +746,14 @@ func (c *Client) handleTruncate(hdr *protocol.Header, payload []byte) {
 
 func (c *Client) handleRename(hdr *protocol.Header, payload []byte) {
 	if c.readOnly {
-		log.Printf("Client %d RENAME denied (read-only)", c.id)
+		logger.Debug("Client %d RENAME denied (read-only)", c.id)
 		c.sendError(hdr, protocol.ErrRofs)
 		return
 	}
 
 	var req protocol.RenameRequest
 	if err := req.Decode(payload); err != nil {
-		log.Printf("Client %d RENAME decode error: %v", c.id, err)
+		logger.Debug("Client %d RENAME decode error: %v", c.id, err)
 		c.sendError(hdr, protocol.ErrProto)
 		return
 	}
@@ -763,22 +763,21 @@ func (c *Client) handleRename(hdr *protocol.Header, payload []byte) {
 	oldName := req.OldName
 	newName := req.NewName
 
-	log.Printf("Client %d RENAME: oldParent=%d oldName=%q -> newParent=%d newName=%q",
+	logger.Debug("Client %d RENAME: oldParent=%d oldName=%q -> newParent=%d newName=%q",
 		c.id, oldParent, oldName, newParent, newName)
 
 	movedIno, err := c.server.storage.Rename(oldParent, oldName, newParent, newName)
 	if err != nil {
-		log.Printf("Client %d RENAME error: %v", c.id, err)
+		logger.Debug("Client %d RENAME error: %v", c.id, err)
 		c.sendError(hdr, storageErrToProto(err))
 		return
 	}
 
-	// Notify watchers: treat rename as delete+create for now
 	c.server.notify.NotifyDelete(oldParent, movedIno, oldName)
 	c.server.notify.NotifyCreate(newParent, movedIno, newName)
 
 	resp := protocol.ErrorResponse{Error: protocol.ErrNone}
-	log.Printf("Client %d RENAME complete ino=%d", c.id, movedIno)
+	logger.Debug("Client %d RENAME complete ino=%d", c.id, movedIno)
 	c.sendResponse(hdr, &resp)
 }
 

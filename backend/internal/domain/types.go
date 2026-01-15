@@ -11,14 +11,15 @@ const (
 )
 
 type Inode struct {
-	Ino       uint64
-	Mode      uint32
-	Nlink     uint32
-	Size      uint64
-	Atime     time.Time
-	Mtime     time.Time
-	Ctime     time.Time
-	DataPages []uint32
+	Ino           uint64
+	Mode          uint32
+	Nlink         uint32
+	Size          uint64
+	Atime         time.Time
+	Mtime         time.Time
+	Ctime         time.Time
+	FirstDataPage uint32
+	NumDataPages  uint32
 }
 
 func (i *Inode) IsDir() bool {

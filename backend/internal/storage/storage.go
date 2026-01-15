@@ -20,10 +20,10 @@ const (
 	InodesPerPage  = PageSize / InodeSize
 	DirEntrySize   = 280
 	MaxNameLen     = 255
-	MaxFileSize    = 100 * 1024 * 1024
+	MaxFileSize    = 2 * 1024 * 1024 * 1024
 
 	InodeTableStart = 2
-	InodeTablePages = 64
+	InodeTablePages = 256
 	DataPagesStart  = InodeTableStart + InodeTablePages
 )
 
@@ -39,6 +39,13 @@ var (
 	ErrTooLarge    = errors.New("file too large")
 )
 
+type InodeData struct {
+	inode      *domain.Inode
+	data       []byte
+	dirEntries []domain.DirEntry
+	dirty      bool
+}
+
 type Storage struct {
 	mu        sync.RWMutex
 	file      *os.File
@@ -47,25 +54,23 @@ type Storage struct {
 	wal       *WAL
 	sb        domain.Superblock
 	maxSize   int64
-	inodes    map[uint64]*domain.Inode
-	dirCache  map[uint64][]domain.DirEntry
-	dataCache map[uint64][]byte
+	inodeData map[uint64]*InodeData
+	freePages []uint32
 }
 
 func NewStorage(path string, maxSize int64) (*Storage, error) {
 	s := &Storage{
 		path:      path,
 		maxSize:   maxSize,
-		inodes:    make(map[uint64]*domain.Inode),
-		dirCache:  make(map[uint64][]domain.DirEntry),
-		dataCache: make(map[uint64][]byte),
+		inodeData: make(map[uint64]*InodeData),
+		freePages: make([]uint32, 0),
 	}
 
 	if err := s.open(); err != nil {
 		return nil, err
 	}
 
-	s.cache = NewCache(1024)
+	s.cache = NewCache(4096)
 
 	return s, nil
 }
@@ -88,7 +93,7 @@ func (s *Storage) create() error {
 	}
 	s.file = f
 
-	initialSize := int64(DataPagesStart+1024) * PageSize
+	initialSize := int64(DataPagesStart+4096) * PageSize
 	if err := f.Truncate(initialSize); err != nil {
 		return err
 	}
@@ -119,10 +124,14 @@ func (s *Storage) create() error {
 		Mtime: now,
 		Ctime: now,
 	}
-	s.inodes[RootIno] = rootInode
-	s.dirCache[RootIno] = []domain.DirEntry{}
 
-	return s.flush()
+	s.inodeData[RootIno] = &InodeData{
+		inode:      rootInode,
+		dirEntries: []domain.DirEntry{},
+		dirty:      true,
+	}
+
+	return s.syncInode(RootIno)
 }
 
 func (s *Storage) load() error {
@@ -162,8 +171,13 @@ func (s *Storage) writeSuperblock() error {
 	binary.LittleEndian.PutUint64(buf[48:56], s.sb.MountCount)
 	binary.LittleEndian.PutUint32(buf[56:60], s.sb.State)
 
-	_, err := s.file.WriteAt(buf, 0)
-	return err
+	if _, err := s.file.WriteAt(buf, 0); err != nil {
+		return err
+	}
+	if _, err := s.file.WriteAt(buf, PageSize); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Storage) readSuperblock() error {
@@ -214,141 +228,150 @@ func (s *Storage) loadInodes() error {
 			inode.Mtime = time.Unix(int64(binary.LittleEndian.Uint64(inodeBuf[32:40])), 0)
 			inode.Ctime = time.Unix(int64(binary.LittleEndian.Uint64(inodeBuf[40:48])), 0)
 
-			numPages := binary.LittleEndian.Uint32(inodeBuf[48:52])
-			inode.DataPages = make([]uint32, numPages)
-			for j := uint32(0); j < numPages && j < 16; j++ {
-				inode.DataPages[j] = binary.LittleEndian.Uint32(inodeBuf[52+j*4 : 56+j*4])
-			}
+			numDataPages := binary.LittleEndian.Uint32(inodeBuf[48:52])
+			firstDataPage := binary.LittleEndian.Uint32(inodeBuf[52:56])
 
-			s.inodes[ino] = inode
+			inodeData := &InodeData{
+				inode: inode,
+				dirty: false,
+			}
 
 			if inode.IsDir() {
-				entries, err := s.loadDirEntries(inode)
-				if err == nil {
-					s.dirCache[ino] = entries
+				if firstDataPage != 0 {
+					entries, err := s.loadDirEntriesFromPage(firstDataPage)
+					if err == nil {
+						inodeData.dirEntries = entries
+					} else {
+						inodeData.dirEntries = []domain.DirEntry{}
+					}
 				} else {
-					s.dirCache[ino] = []domain.DirEntry{}
+					inodeData.dirEntries = []domain.DirEntry{}
 				}
-			} else if inode.Size > 0 {
-				data, err := s.loadFileData(inode)
+			} else if inode.Size > 0 && numDataPages > 0 && firstDataPage != 0 {
+				data, err := s.loadFileDataFromPages(firstDataPage, numDataPages, inode.Size)
 				if err == nil {
-					s.dataCache[ino] = data
+					inodeData.data = data
 				}
 			}
+
+			s.inodeData[ino] = inodeData
 		}
 	}
 
-	if _, ok := s.inodes[RootIno]; !ok {
+	if _, ok := s.inodeData[RootIno]; !ok {
 		now := time.Now()
-		s.inodes[RootIno] = &domain.Inode{
-			Ino:   RootIno,
-			Mode:  domain.S_IFDIR | 0777,
-			Nlink: 2,
-			Size:  0,
-			Atime: now,
-			Mtime: now,
-			Ctime: now,
+		s.inodeData[RootIno] = &InodeData{
+			inode: &domain.Inode{
+				Ino:   RootIno,
+				Mode:  domain.S_IFDIR | 0777,
+				Nlink: 2,
+				Size:  0,
+				Atime: now,
+				Mtime: now,
+				Ctime: now,
+			},
+			dirEntries: []domain.DirEntry{},
+			dirty:      true,
 		}
-		s.dirCache[RootIno] = []domain.DirEntry{}
 	}
 
 	return nil
 }
 
-func (s *Storage) loadDirEntries(inode *domain.Inode) ([]domain.DirEntry, error) {
+func (s *Storage) loadDirEntriesFromPage(pageNum uint32) ([]domain.DirEntry, error) {
 	var entries []domain.DirEntry
 
-	for _, pageNum := range inode.DataPages {
-		if pageNum == 0 {
-			continue
-		}
+	buf := make([]byte, PageSize)
+	offset := int64(pageNum) * PageSize
+	_, err := s.file.ReadAt(buf, offset)
+	if err != nil {
+		return entries, err
+	}
 
-		buf := make([]byte, PageSize)
-		offset := int64(pageNum) * PageSize
-		_, err := s.file.ReadAt(buf, offset)
-		if err != nil {
-			continue
+	numEntries := binary.LittleEndian.Uint32(buf[0:4])
+	off := 4
+	for i := uint32(0); i < numEntries; i++ {
+		if off+DirEntrySize > PageSize {
+			break
 		}
+		ino := binary.LittleEndian.Uint64(buf[off : off+8])
+		mode := binary.LittleEndian.Uint32(buf[off+8 : off+12])
+		nameLen := binary.LittleEndian.Uint16(buf[off+12 : off+14])
+		name := string(buf[off+14 : off+14+int(nameLen)])
 
-		numEntries := binary.LittleEndian.Uint32(buf[0:4])
-		off := 4
-		for i := uint32(0); i < numEntries; i++ {
-			if off+DirEntrySize > PageSize {
-				break
-			}
-			ino := binary.LittleEndian.Uint64(buf[off : off+8])
-			mode := binary.LittleEndian.Uint32(buf[off+8 : off+12])
-			nameLen := binary.LittleEndian.Uint16(buf[off+12 : off+14])
-			name := string(buf[off+14 : off+14+int(nameLen)])
-
-			if ino != 0 {
-				entries = append(entries, domain.DirEntry{
-					Ino:  ino,
-					Mode: mode,
-					Name: name,
-				})
-			}
-			off += DirEntrySize
+		if ino != 0 {
+			entries = append(entries, domain.DirEntry{
+				Ino:  ino,
+				Mode: mode,
+				Name: name,
+			})
 		}
+		off += DirEntrySize
 	}
 
 	return entries, nil
 }
 
-func (s *Storage) loadFileData(inode *domain.Inode) ([]byte, error) {
-	data := make([]byte, 0, inode.Size)
+func (s *Storage) loadFileDataFromPages(firstPage uint32, numPages uint32, size uint64) ([]byte, error) {
+	data := make([]byte, 0, size)
+	dataPerPage := PageSize - 8
 
-	for _, pageNum := range inode.DataPages {
-		if pageNum == 0 {
-			continue
-		}
-
+	currentPage := firstPage
+	for i := uint32(0); i < numPages && currentPage != 0; i++ {
 		buf := make([]byte, PageSize)
-		offset := int64(pageNum) * PageSize
+		offset := int64(currentPage) * PageSize
 		_, err := s.file.ReadAt(buf, offset)
 		if err != nil {
-			continue
+			break
 		}
 
-		dataLen := binary.LittleEndian.Uint32(buf[0:4])
-		if dataLen > PageSize-4 {
-			dataLen = PageSize - 4
+		nextPage := binary.LittleEndian.Uint32(buf[0:4])
+		chunkLen := binary.LittleEndian.Uint32(buf[4:8])
+
+		if chunkLen > uint32(dataPerPage) {
+			chunkLen = uint32(dataPerPage)
 		}
-		data = append(data, buf[4:4+dataLen]...)
+
+		data = append(data, buf[8:8+chunkLen]...)
+		currentPage = nextPage
 	}
 
-	if uint64(len(data)) > inode.Size {
-		data = data[:inode.Size]
+	if uint64(len(data)) > size {
+		data = data[:size]
 	}
 
 	return data, nil
 }
 
-func (s *Storage) flush() error {
-	for ino, inode := range s.inodes {
-		if err := s.writeInode(inode); err != nil {
+func (s *Storage) syncInode(ino uint64) error {
+	inodeData, ok := s.inodeData[ino]
+	if !ok {
+		return ErrNotFound
+	}
+
+	if !inodeData.dirty {
+		return nil
+	}
+
+	if inodeData.inode.IsDir() {
+		if err := s.writeDirEntriesToDisk(inodeData); err != nil {
 			return err
 		}
-
-		if inode.IsDir() {
-			if entries, ok := s.dirCache[ino]; ok {
-				if err := s.writeDirEntries(inode, entries); err != nil {
-					return err
-				}
-			}
-		} else {
-			if data, ok := s.dataCache[ino]; ok {
-				if err := s.writeFileData(inode, data); err != nil {
-					return err
-				}
-			}
+	} else if len(inodeData.data) > 0 {
+		if err := s.writeFileDataToDisk(inodeData); err != nil {
+			return err
 		}
 	}
 
-	return s.writeSuperblock()
+	if err := s.writeInodeToDisk(inodeData.inode); err != nil {
+		return err
+	}
+
+	inodeData.dirty = false
+	return nil
 }
 
-func (s *Storage) writeInode(inode *domain.Inode) error {
+func (s *Storage) writeInodeToDisk(inode *domain.Inode) error {
 	pageNum := InodeTableStart + uint32((inode.Ino-1)/uint64(InodesPerPage))
 	indexInPage := int((inode.Ino - 1) % uint64(InodesPerPage))
 
@@ -364,27 +387,30 @@ func (s *Storage) writeInode(inode *domain.Inode) error {
 	binary.LittleEndian.PutUint64(inodeBuf[24:32], uint64(inode.Atime.Unix()))
 	binary.LittleEndian.PutUint64(inodeBuf[32:40], uint64(inode.Mtime.Unix()))
 	binary.LittleEndian.PutUint64(inodeBuf[40:48], uint64(inode.Ctime.Unix()))
-
-	numPages := uint32(len(inode.DataPages))
-	binary.LittleEndian.PutUint32(inodeBuf[48:52], numPages)
-	for j := uint32(0); j < numPages && j < 16; j++ {
-		binary.LittleEndian.PutUint32(inodeBuf[52+j*4:56+j*4], inode.DataPages[j])
-	}
+	binary.LittleEndian.PutUint32(inodeBuf[48:52], inode.NumDataPages)
+	binary.LittleEndian.PutUint32(inodeBuf[52:56], inode.FirstDataPage)
 
 	_, err := s.file.WriteAt(buf, offset)
 	return err
 }
 
-func (s *Storage) writeDirEntries(inode *domain.Inode, entries []domain.DirEntry) error {
-	if len(inode.DataPages) == 0 {
+func (s *Storage) writeDirEntriesToDisk(inodeData *InodeData) error {
+	inode := inodeData.inode
+	entries := inodeData.dirEntries
+
+	if inode.FirstDataPage == 0 && len(entries) > 0 {
 		page, err := s.allocPage()
 		if err != nil {
 			return err
 		}
-		inode.DataPages = []uint32{page}
+		inode.FirstDataPage = page
+		inode.NumDataPages = 1
 	}
 
-	pageNum := inode.DataPages[0]
+	if inode.FirstDataPage == 0 {
+		return nil
+	}
+
 	buf := make([]byte, PageSize)
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(entries)))
 
@@ -404,39 +430,67 @@ func (s *Storage) writeDirEntries(inode *domain.Inode, entries []domain.DirEntry
 		off += DirEntrySize
 	}
 
-	offset := int64(pageNum) * PageSize
-	_, err := s.file.WriteAt(buf, offset)
+	pageOffset := int64(inode.FirstDataPage) * PageSize
+	_, err := s.file.WriteAt(buf, pageOffset)
 	return err
 }
 
-func (s *Storage) writeFileData(inode *domain.Inode, data []byte) error {
-	neededPages := (len(data) + PageSize - 5) / (PageSize - 4)
-	if neededPages == 0 {
-		neededPages = 1
+func (s *Storage) writeFileDataToDisk(inodeData *InodeData) error {
+	inode := inodeData.inode
+	data := inodeData.data
+
+	if len(data) == 0 {
+		return nil
 	}
 
-	for len(inode.DataPages) < neededPages {
+	dataPerPage := PageSize - 8
+	neededPages := (len(data) + dataPerPage - 1) / dataPerPage
+
+	var pages []uint32
+
+	if inode.FirstDataPage != 0 {
+		currentPage := inode.FirstDataPage
+		for currentPage != 0 && len(pages) < neededPages {
+			pages = append(pages, currentPage)
+
+			buf := make([]byte, 4)
+			s.file.ReadAt(buf, int64(currentPage)*PageSize)
+			currentPage = binary.LittleEndian.Uint32(buf)
+		}
+	}
+
+	for len(pages) < neededPages {
 		page, err := s.allocPage()
 		if err != nil {
 			return err
 		}
-		inode.DataPages = append(inode.DataPages, page)
+		pages = append(pages, page)
 	}
 
+	if len(pages) > 0 {
+		inode.FirstDataPage = pages[0]
+	}
+	inode.NumDataPages = uint32(len(pages))
+
 	offset := 0
-	for i := 0; i < neededPages; i++ {
-		pageNum := inode.DataPages[i]
+	for i, pageNum := range pages {
 		buf := make([]byte, PageSize)
 
+		var nextPage uint32 = 0
+		if i+1 < len(pages) {
+			nextPage = pages[i+1]
+		}
+		binary.LittleEndian.PutUint32(buf[0:4], nextPage)
+
 		remaining := len(data) - offset
-		chunkSize := PageSize - 4
+		chunkSize := dataPerPage
 		if remaining < chunkSize {
 			chunkSize = remaining
 		}
 
-		binary.LittleEndian.PutUint32(buf[0:4], uint32(chunkSize))
+		binary.LittleEndian.PutUint32(buf[4:8], uint32(chunkSize))
 		if chunkSize > 0 {
-			copy(buf[4:], data[offset:offset+chunkSize])
+			copy(buf[8:8+chunkSize], data[offset:offset+chunkSize])
 		}
 
 		pageOffset := int64(pageNum) * PageSize
@@ -451,6 +505,12 @@ func (s *Storage) writeFileData(inode *domain.Inode, data []byte) error {
 }
 
 func (s *Storage) allocPage() (uint32, error) {
+	if len(s.freePages) > 0 {
+		page := s.freePages[len(s.freePages)-1]
+		s.freePages = s.freePages[:len(s.freePages)-1]
+		return page, nil
+	}
+
 	if s.sb.FreePages == 0 {
 		if err := s.growFile(); err != nil {
 			return 0, err
@@ -465,7 +525,7 @@ func (s *Storage) allocPage() (uint32, error) {
 }
 
 func (s *Storage) growFile() error {
-	newPages := uint64(1024)
+	newPages := uint64(4096)
 	newSize := int64(s.sb.TotalPages+newPages) * PageSize
 
 	if newSize > s.maxSize {
@@ -486,18 +546,18 @@ func (s *Storage) Lookup(parentIno uint64, name string) (*domain.Inode, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	entries, ok := s.dirCache[parentIno]
+	inodeData, ok := s.inodeData[parentIno]
 	if !ok {
 		return nil, ErrNotFound
 	}
 
-	for _, entry := range entries {
+	for _, entry := range inodeData.dirEntries {
 		if entry.Name == name {
-			inode, ok := s.inodes[entry.Ino]
+			targetData, ok := s.inodeData[entry.Ino]
 			if !ok {
 				return nil, ErrNotFound
 			}
-			return inode, nil
+			return targetData.inode, nil
 		}
 	}
 
@@ -508,33 +568,28 @@ func (s *Storage) GetInode(ino uint64) (*domain.Inode, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	inode, ok := s.inodes[ino]
+	inodeData, ok := s.inodeData[ino]
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return inode, nil
+	return inodeData.inode, nil
 }
 
 func (s *Storage) List(parentIno uint64) ([]domain.DirEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	parent, ok := s.inodes[parentIno]
+	inodeData, ok := s.inodeData[parentIno]
 	if !ok {
 		return nil, ErrNotFound
 	}
 
-	if !parent.IsDir() {
+	if !inodeData.inode.IsDir() {
 		return nil, ErrNotDir
 	}
 
-	entries, ok := s.dirCache[parentIno]
-	if !ok {
-		return []domain.DirEntry{}, nil
-	}
-
-	result := make([]domain.DirEntry, len(entries))
-	copy(result, entries)
+	result := make([]domain.DirEntry, len(inodeData.dirEntries))
+	copy(result, inodeData.dirEntries)
 	return result, nil
 }
 
@@ -546,17 +601,16 @@ func (s *Storage) Create(parentIno uint64, name string, mode uint32) (*domain.In
 		return nil, ErrInvalidName
 	}
 
-	parent, ok := s.inodes[parentIno]
+	parentData, ok := s.inodeData[parentIno]
 	if !ok {
 		return nil, ErrNotFound
 	}
 
-	if !parent.IsDir() {
+	if !parentData.inode.IsDir() {
 		return nil, ErrNotDir
 	}
 
-	entries := s.dirCache[parentIno]
-	for _, entry := range entries {
+	for _, entry := range parentData.dirEntries {
 		if entry.Name == name {
 			return nil, ErrExists
 		}
@@ -576,18 +630,25 @@ func (s *Storage) Create(parentIno uint64, name string, mode uint32) (*domain.In
 		Ctime: now,
 	}
 
-	s.inodes[ino] = inode
-	s.dataCache[ino] = []byte{}
-	s.dirCache[parentIno] = append(entries, domain.DirEntry{
+	s.inodeData[ino] = &InodeData{
+		inode: inode,
+		data:  []byte{},
+		dirty: true,
+	}
+
+	parentData.dirEntries = append(parentData.dirEntries, domain.DirEntry{
 		Ino:  ino,
 		Mode: inode.Mode,
 		Name: name,
 	})
+	parentData.inode.Mtime = now
+	parentData.inode.Ctime = now
+	parentData.dirty = true
 
-	parent.Mtime = now
-	parent.Ctime = now
+	s.syncInode(ino)
+	s.syncInode(parentIno)
+	s.writeSuperblock()
 
-	s.flush()
 	return inode, nil
 }
 
@@ -599,17 +660,16 @@ func (s *Storage) Mkdir(parentIno uint64, name string, mode uint32) (*domain.Ino
 		return nil, ErrInvalidName
 	}
 
-	parent, ok := s.inodes[parentIno]
+	parentData, ok := s.inodeData[parentIno]
 	if !ok {
 		return nil, ErrNotFound
 	}
 
-	if !parent.IsDir() {
+	if !parentData.inode.IsDir() {
 		return nil, ErrNotDir
 	}
 
-	entries := s.dirCache[parentIno]
-	for _, entry := range entries {
+	for _, entry := range parentData.dirEntries {
 		if entry.Name == name {
 			return nil, ErrExists
 		}
@@ -629,19 +689,26 @@ func (s *Storage) Mkdir(parentIno uint64, name string, mode uint32) (*domain.Ino
 		Ctime: now,
 	}
 
-	s.inodes[ino] = inode
-	s.dirCache[ino] = []domain.DirEntry{}
-	s.dirCache[parentIno] = append(entries, domain.DirEntry{
+	s.inodeData[ino] = &InodeData{
+		inode:      inode,
+		dirEntries: []domain.DirEntry{},
+		dirty:      true,
+	}
+
+	parentData.dirEntries = append(parentData.dirEntries, domain.DirEntry{
 		Ino:  ino,
 		Mode: inode.Mode,
 		Name: name,
 	})
+	parentData.inode.Nlink++
+	parentData.inode.Mtime = now
+	parentData.inode.Ctime = now
+	parentData.dirty = true
 
-	parent.Nlink++
-	parent.Mtime = now
-	parent.Ctime = now
+	s.syncInode(ino)
+	s.syncInode(parentIno)
+	s.writeSuperblock()
 
-	s.flush()
 	return inode, nil
 }
 
@@ -653,15 +720,14 @@ func (s *Storage) Unlink(parentIno uint64, name string) error {
 		return ErrInvalidName
 	}
 
-	parent, ok := s.inodes[parentIno]
+	parentData, ok := s.inodeData[parentIno]
 	if !ok {
 		return ErrNotFound
 	}
 
-	entries := s.dirCache[parentIno]
 	idx := -1
 	var targetIno uint64
-	for i, entry := range entries {
+	for i, entry := range parentData.dirEntries {
 		if entry.Name == name {
 			idx = i
 			targetIno = entry.Ino
@@ -673,28 +739,30 @@ func (s *Storage) Unlink(parentIno uint64, name string) error {
 		return ErrNotFound
 	}
 
-	target, ok := s.inodes[targetIno]
+	targetData, ok := s.inodeData[targetIno]
 	if !ok {
 		return ErrNotFound
 	}
 
-	if target.IsDir() {
+	if targetData.inode.IsDir() {
 		return ErrIsDir
 	}
 
-	target.Nlink--
-	if target.Nlink == 0 {
-		delete(s.inodes, targetIno)
-		delete(s.dataCache, targetIno)
+	targetData.inode.Nlink--
+	if targetData.inode.Nlink == 0 {
+		delete(s.inodeData, targetIno)
+	} else {
+		targetData.dirty = true
+		s.syncInode(targetIno)
 	}
 
-	s.dirCache[parentIno] = append(entries[:idx], entries[idx+1:]...)
-
+	parentData.dirEntries = append(parentData.dirEntries[:idx], parentData.dirEntries[idx+1:]...)
 	now := time.Now()
-	parent.Mtime = now
-	parent.Ctime = now
+	parentData.inode.Mtime = now
+	parentData.inode.Ctime = now
+	parentData.dirty = true
 
-	s.flush()
+	s.syncInode(parentIno)
 	return nil
 }
 
@@ -706,15 +774,14 @@ func (s *Storage) Rmdir(parentIno uint64, name string) error {
 		return ErrInvalidName
 	}
 
-	parent, ok := s.inodes[parentIno]
+	parentData, ok := s.inodeData[parentIno]
 	if !ok {
 		return ErrNotFound
 	}
 
-	entries := s.dirCache[parentIno]
 	idx := -1
 	var targetIno uint64
-	for i, entry := range entries {
+	for i, entry := range parentData.dirEntries {
 		if entry.Name == name {
 			idx = i
 			targetIno = entry.Ino
@@ -726,31 +793,29 @@ func (s *Storage) Rmdir(parentIno uint64, name string) error {
 		return ErrNotFound
 	}
 
-	target, ok := s.inodes[targetIno]
+	targetData, ok := s.inodeData[targetIno]
 	if !ok {
 		return ErrNotFound
 	}
 
-	if !target.IsDir() {
+	if !targetData.inode.IsDir() {
 		return ErrNotDir
 	}
 
-	targetEntries := s.dirCache[targetIno]
-	if len(targetEntries) > 0 {
+	if len(targetData.dirEntries) > 0 {
 		return ErrNotEmpty
 	}
 
-	delete(s.inodes, targetIno)
-	delete(s.dirCache, targetIno)
+	delete(s.inodeData, targetIno)
 
-	s.dirCache[parentIno] = append(entries[:idx], entries[idx+1:]...)
-
-	parent.Nlink--
+	parentData.dirEntries = append(parentData.dirEntries[:idx], parentData.dirEntries[idx+1:]...)
+	parentData.inode.Nlink--
 	now := time.Now()
-	parent.Mtime = now
-	parent.Ctime = now
+	parentData.inode.Mtime = now
+	parentData.inode.Ctime = now
+	parentData.dirty = true
 
-	s.flush()
+	s.syncInode(parentIno)
 	return nil
 }
 
@@ -762,44 +827,47 @@ func (s *Storage) Link(ino uint64, newParentIno uint64, newName string) error {
 		return ErrInvalidName
 	}
 
-	target, ok := s.inodes[ino]
+	targetData, ok := s.inodeData[ino]
 	if !ok {
 		return ErrNotFound
 	}
 
-	if target.IsDir() {
+	if targetData.inode.IsDir() {
 		return ErrIsDir
 	}
 
-	newParent, ok := s.inodes[newParentIno]
+	newParentData, ok := s.inodeData[newParentIno]
 	if !ok {
 		return ErrNotFound
 	}
 
-	if !newParent.IsDir() {
+	if !newParentData.inode.IsDir() {
 		return ErrNotDir
 	}
 
-	entries := s.dirCache[newParentIno]
-	for _, entry := range entries {
+	for _, entry := range newParentData.dirEntries {
 		if entry.Name == newName {
 			return ErrExists
 		}
 	}
 
-	target.Nlink++
-	s.dirCache[newParentIno] = append(entries, domain.DirEntry{
+	targetData.inode.Nlink++
+	targetData.dirty = true
+
+	newParentData.dirEntries = append(newParentData.dirEntries, domain.DirEntry{
 		Ino:  ino,
-		Mode: target.Mode,
+		Mode: targetData.inode.Mode,
 		Name: newName,
 	})
 
 	now := time.Now()
-	newParent.Mtime = now
-	newParent.Ctime = now
-	target.Ctime = now
+	newParentData.inode.Mtime = now
+	newParentData.inode.Ctime = now
+	targetData.inode.Ctime = now
+	newParentData.dirty = true
 
-	s.flush()
+	s.syncInode(ino)
+	s.syncInode(newParentIno)
 	return nil
 }
 
@@ -807,17 +875,17 @@ func (s *Storage) Read(ino uint64, offset int64, size int64) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	inode, ok := s.inodes[ino]
+	inodeData, ok := s.inodeData[ino]
 	if !ok {
 		return nil, ErrNotFound
 	}
 
-	if inode.IsDir() {
+	if inodeData.inode.IsDir() {
 		return nil, ErrIsDir
 	}
 
-	data, ok := s.dataCache[ino]
-	if !ok {
+	data := inodeData.data
+	if data == nil {
 		data = []byte{}
 	}
 
@@ -839,12 +907,12 @@ func (s *Storage) Write(ino uint64, offset int64, data []byte) (int64, int64, er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	inode, ok := s.inodes[ino]
+	inodeData, ok := s.inodeData[ino]
 	if !ok {
 		return 0, 0, ErrNotFound
 	}
 
-	if inode.IsDir() {
+	if inodeData.inode.IsDir() {
 		return 0, 0, ErrIsDir
 	}
 
@@ -853,8 +921,8 @@ func (s *Storage) Write(ino uint64, offset int64, data []byte) (int64, int64, er
 		return 0, 0, ErrTooLarge
 	}
 
-	existing, ok := s.dataCache[ino]
-	if !ok {
+	existing := inodeData.data
+	if existing == nil {
 		existing = []byte{}
 	}
 
@@ -865,15 +933,17 @@ func (s *Storage) Write(ino uint64, offset int64, data []byte) (int64, int64, er
 	}
 
 	copy(existing[offset:], data)
-	s.dataCache[ino] = existing
+	inodeData.data = existing
 
-	inode.Size = uint64(len(existing))
+	inodeData.inode.Size = uint64(len(existing))
 	now := time.Now()
-	inode.Mtime = now
-	inode.Ctime = now
+	inodeData.inode.Mtime = now
+	inodeData.inode.Ctime = now
+	inodeData.dirty = true
 
-	s.flush()
-	return int64(len(data)), int64(inode.Size), nil
+	s.syncInode(ino)
+
+	return int64(len(data)), int64(inodeData.inode.Size), nil
 }
 
 func (s *Storage) GetTotalSize() int64 {
@@ -881,9 +951,9 @@ func (s *Storage) GetTotalSize() int64 {
 	defer s.mu.RUnlock()
 
 	var total int64
-	for _, inode := range s.inodes {
-		if !inode.IsDir() {
-			total += int64(inode.Size)
+	for _, inodeData := range s.inodeData {
+		if !inodeData.inode.IsDir() {
+			total += int64(inodeData.inode.Size)
 		}
 	}
 	return total
@@ -892,6 +962,10 @@ func (s *Storage) GetTotalSize() int64 {
 func (s *Storage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	for ino := range s.inodeData {
+		s.syncInode(ino)
+	}
 
 	s.sb.State = domain.StateClean
 	s.writeSuperblock()
@@ -903,8 +977,10 @@ func (s *Storage) Sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.flush(); err != nil {
-		return err
+	for ino, inodeData := range s.inodeData {
+		if inodeData.dirty {
+			s.syncInode(ino)
+		}
 	}
 	return s.file.Sync()
 }
@@ -913,17 +989,17 @@ func (s *Storage) Truncate(ino uint64, size int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	inode, ok := s.inodes[ino]
+	inodeData, ok := s.inodeData[ino]
 	if !ok {
 		return ErrNotFound
 	}
 
-	if inode.IsDir() {
+	if inodeData.inode.IsDir() {
 		return ErrIsDir
 	}
 
-	data, ok := s.dataCache[ino]
-	if !ok {
+	data := inodeData.data
+	if data == nil {
 		data = []byte{}
 	}
 
@@ -935,13 +1011,14 @@ func (s *Storage) Truncate(ino uint64, size int64) error {
 		data = newData
 	}
 
-	s.dataCache[ino] = data
-	inode.Size = uint64(size)
+	inodeData.data = data
+	inodeData.inode.Size = uint64(size)
 	now := time.Now()
-	inode.Mtime = now
-	inode.Ctime = now
+	inodeData.inode.Mtime = now
+	inodeData.inode.Ctime = now
+	inodeData.dirty = true
 
-	s.flush()
+	s.syncInode(ino)
 	return nil
 }
 
@@ -956,31 +1033,26 @@ func (s *Storage) Rename(oldParentIno uint64, oldName string, newParentIno uint6
 		return 0, ErrInvalidName
 	}
 
-	oldParent, ok := s.inodes[oldParentIno]
+	oldParentData, ok := s.inodeData[oldParentIno]
 	if !ok {
 		return 0, ErrNotFound
 	}
-	if !oldParent.IsDir() {
+	if !oldParentData.inode.IsDir() {
 		return 0, ErrNotDir
 	}
 
-	newParent, ok := s.inodes[newParentIno]
+	newParentData, ok := s.inodeData[newParentIno]
 	if !ok {
 		return 0, ErrNotFound
 	}
-	if !newParent.IsDir() {
+	if !newParentData.inode.IsDir() {
 		return 0, ErrNotDir
-	}
-
-	oldEntries, ok := s.dirCache[oldParentIno]
-	if !ok {
-		return 0, ErrNotFound
 	}
 
 	srcIdx := -1
 	var srcIno uint64
 	var srcMode uint32
-	for i, e := range oldEntries {
+	for i, e := range oldParentData.dirEntries {
 		if e.Name == oldName {
 			srcIdx = i
 			srcIno = e.Ino
@@ -992,7 +1064,7 @@ func (s *Storage) Rename(oldParentIno uint64, oldName string, newParentIno uint6
 		return 0, ErrNotFound
 	}
 
-	srcInode, ok := s.inodes[srcIno]
+	srcData, ok := s.inodeData[srcIno]
 	if !ok {
 		return 0, ErrNotFound
 	}
@@ -1001,10 +1073,9 @@ func (s *Storage) Rename(oldParentIno uint64, oldName string, newParentIno uint6
 		return srcIno, nil
 	}
 
-	newEntries := s.dirCache[newParentIno]
 	dstIdx := -1
 	var dstIno uint64
-	for i, e := range newEntries {
+	for i, e := range newParentData.dirEntries {
 		if e.Name == newName {
 			dstIdx = i
 			dstIno = e.Ino
@@ -1013,69 +1084,150 @@ func (s *Storage) Rename(oldParentIno uint64, oldName string, newParentIno uint6
 	}
 
 	if dstIdx != -1 {
-		dstInode, ok := s.inodes[dstIno]
+		dstData, ok := s.inodeData[dstIno]
 		if !ok {
 			return 0, ErrNotFound
 		}
 
-		if srcInode.IsDir() && !dstInode.IsDir() {
+		if srcData.inode.IsDir() && !dstData.inode.IsDir() {
 			return 0, ErrNotDir
 		}
-		if !srcInode.IsDir() && dstInode.IsDir() {
+		if !srcData.inode.IsDir() && dstData.inode.IsDir() {
 			return 0, ErrIsDir
 		}
 
-		if dstInode.IsDir() {
-			dstEntries := s.dirCache[dstIno]
-			if len(dstEntries) > 0 {
+		if dstData.inode.IsDir() {
+			if len(dstData.dirEntries) > 0 {
 				return 0, ErrNotEmpty
 			}
-			delete(s.inodes, dstIno)
-			delete(s.dirCache, dstIno)
-
-			newEntries = append(newEntries[:dstIdx], newEntries[dstIdx+1:]...)
-			s.dirCache[newParentIno] = newEntries
-
-			if newParent.Nlink > 0 {
-				newParent.Nlink--
+			delete(s.inodeData, dstIno)
+			newParentData.dirEntries = append(newParentData.dirEntries[:dstIdx], newParentData.dirEntries[dstIdx+1:]...)
+			if newParentData.inode.Nlink > 0 {
+				newParentData.inode.Nlink--
 			}
 		} else {
-			dstInode.Nlink--
-			if dstInode.Nlink == 0 {
-				delete(s.inodes, dstIno)
-				delete(s.dataCache, dstIno)
+			dstData.inode.Nlink--
+			if dstData.inode.Nlink == 0 {
+				delete(s.inodeData, dstIno)
 			}
-			newEntries = append(newEntries[:dstIdx], newEntries[dstIdx+1:]...)
-			s.dirCache[newParentIno] = newEntries
+			newParentData.dirEntries = append(newParentData.dirEntries[:dstIdx], newParentData.dirEntries[dstIdx+1:]...)
 		}
 	}
 
-	oldEntries = append(oldEntries[:srcIdx], oldEntries[srcIdx+1:]...)
-	s.dirCache[oldParentIno] = oldEntries
+	oldParentData.dirEntries = append(oldParentData.dirEntries[:srcIdx], oldParentData.dirEntries[srcIdx+1:]...)
 
 	entry := domain.DirEntry{
 		Ino:  srcIno,
 		Mode: srcMode,
 		Name: newName,
 	}
-	s.dirCache[newParentIno] = append(s.dirCache[newParentIno], entry)
+	newParentData.dirEntries = append(newParentData.dirEntries, entry)
 
 	now := time.Now()
 
-	if srcInode.IsDir() && oldParentIno != newParentIno {
-		if oldParent.Nlink > 0 {
-			oldParent.Nlink--
+	if srcData.inode.IsDir() && oldParentIno != newParentIno {
+		if oldParentData.inode.Nlink > 0 {
+			oldParentData.inode.Nlink--
 		}
-		newParent.Nlink++
+		newParentData.inode.Nlink++
 	}
 
-	oldParent.Mtime, oldParent.Ctime = now, now
-	newParent.Mtime, newParent.Ctime = now, now
-	srcInode.Ctime = now
+	oldParentData.inode.Mtime, oldParentData.inode.Ctime = now, now
+	newParentData.inode.Mtime, newParentData.inode.Ctime = now, now
+	srcData.inode.Ctime = now
+	oldParentData.dirty = true
+	newParentData.dirty = true
+	srcData.dirty = true
 
-	if err := s.flush(); err != nil {
-		return 0, err
+	s.syncInode(oldParentIno)
+	if oldParentIno != newParentIno {
+		s.syncInode(newParentIno)
 	}
+	s.syncInode(srcIno)
 
 	return srcIno, nil
+}
+
+func (s *Storage) GetFileData(ino uint64) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	inodeData, ok := s.inodeData[ino]
+	if !ok {
+		return nil, ErrNotFound
+	}
+
+	if inodeData.inode.IsDir() {
+		return nil, ErrIsDir
+	}
+
+	result := make([]byte, len(inodeData.data))
+	copy(result, inodeData.data)
+	return result, nil
+}
+
+func (s *Storage) WalkPath(path string) (*domain.Inode, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if path == "" || path == "/" {
+		return s.inodeData[RootIno].inode, nil
+	}
+
+	parts := splitPath(path)
+	currentIno := uint64(RootIno)
+
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+
+		currentData, ok := s.inodeData[currentIno]
+		if !ok {
+			return nil, ErrNotFound
+		}
+
+		if !currentData.inode.IsDir() {
+			return nil, ErrNotDir
+		}
+
+		found := false
+		for _, entry := range currentData.dirEntries {
+			if entry.Name == part {
+				currentIno = entry.Ino
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return nil, ErrNotFound
+		}
+	}
+
+	inodeData, ok := s.inodeData[currentIno]
+	if !ok {
+		return nil, ErrNotFound
+	}
+
+	return inodeData.inode, nil
+}
+
+func splitPath(path string) []string {
+	var parts []string
+	current := ""
+	for _, c := range path {
+		if c == '/' {
+			if current != "" {
+				parts = append(parts, current)
+				current = ""
+			}
+		} else {
+			current += string(c)
+		}
+	}
+	if current != "" {
+		parts = append(parts, current)
+	}
+	return parts
 }

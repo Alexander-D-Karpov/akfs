@@ -8,6 +8,7 @@ SERVER_HOST ?= 127.0.0.1
 SERVER_PORT ?= 9000
 TOKEN ?= admin
 KEY ?= 0123456789abcdef0123456789abcdef
+RSIZE ?= 1048576
 
 DOCKER ?= docker
 COMPOSE ?= $(DOCKER) compose
@@ -31,6 +32,7 @@ help:
 	@echo "  MOUNT_POINT=$(MOUNT_POINT)"
 	@echo "  SERVER_HOST=$(SERVER_HOST)"
 	@echo "  SERVER_PORT=$(SERVER_PORT)"
+	@echo "  RSIZE=$(RSIZE) (readahead size in bytes)"
 
 all: build-backend build-kernel
 
@@ -60,9 +62,7 @@ wait-server:
 	exit 1
 
 unload-module:
-	@# Unmount first (module removal will fail if still mounted)
 	@mountpoint -q $(MOUNT_POINT) && sudo umount $(MOUNT_POINT) || true
-	@# Remove module only if it is actually loaded
 	@if lsmod | grep -q '^$(MODULE_NAME)\b'; then \
 		echo "Unloading $(MODULE_NAME)..."; \
 		sudo modprobe -r $(MODULE_NAME) 2>/dev/null || sudo rmmod $(MODULE_NAME); \
@@ -77,9 +77,7 @@ unload-module:
 		echo "$(MODULE_NAME) not loaded."; \
 	fi
 
-
 load-module:
-	@# If already loaded, don’t fail (prevents 'File exists')
 	@if lsmod | grep -q '^$(MODULE_NAME)\b'; then \
 		echo "$(MODULE_NAME) already loaded; skipping insmod."; \
 	else \
@@ -95,14 +93,14 @@ mount: build-kernel run wait-server load-module
 	@mkdir -p $(MOUNT_POINT)
 	@mountpoint -q $(MOUNT_POINT) && sudo umount $(MOUNT_POINT) || true
 	sudo mount -t vtfs none $(MOUNT_POINT) \
-		-o host=$(SERVER_HOST),port=$(SERVER_PORT),token=$(TOKEN),key=$(KEY)
+		-o host=$(SERVER_HOST),port=$(SERVER_PORT),token=$(TOKEN),key=$(KEY),rsize=$(RSIZE)
 	@echo "Mounted VTFS at $(MOUNT_POINT)"
 
 mount-ro: build-kernel run wait-server load-module
 	@mkdir -p $(MOUNT_POINT)
 	@mountpoint -q $(MOUNT_POINT) && sudo umount $(MOUNT_POINT) || true
 	sudo mount -t vtfs none $(MOUNT_POINT) \
-		-o host=$(SERVER_HOST),port=$(SERVER_PORT),key=$(KEY)
+		-o host=$(SERVER_HOST),port=$(SERVER_PORT),key=$(KEY),rsize=$(RSIZE)
 	@echo "Mounted VTFS (read-only) at $(MOUNT_POINT)"
 
 umount:

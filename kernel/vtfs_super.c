@@ -10,6 +10,7 @@ enum vtfs_param {
     Opt_port,
     Opt_token,
     Opt_key,
+    Opt_rsize,
 };
 
 static const struct fs_parameter_spec vtfs_fs_parameters[] = {
@@ -17,6 +18,7 @@ static const struct fs_parameter_spec vtfs_fs_parameters[] = {
     fsparam_u32("port",     Opt_port),
     fsparam_string("token", Opt_token),
     fsparam_string("key",   Opt_key),
+    fsparam_u32("rsize",    Opt_rsize),
     {}
 };
 
@@ -25,6 +27,7 @@ struct vtfs_fs_context {
     int port;
     char *token;
     char *key;
+    size_t rsize;
 };
 
 static int vtfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
@@ -58,6 +61,13 @@ static int vtfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
         ctx->key = kstrdup(param->string, GFP_KERNEL);
         if (!ctx->key)
             return -ENOMEM;
+        break;
+    case Opt_rsize:
+        ctx->rsize = result.uint_32;
+        if (ctx->rsize < 4096)
+            ctx->rsize = 4096;
+        if (ctx->rsize > 16 * 1024 * 1024)
+            ctx->rsize = 16 * 1024 * 1024;
         break;
     default:
         return -EINVAL;
@@ -101,6 +111,7 @@ int vtfs_init_fs_context(struct fs_context *fc)
     ctx->port = 9000;
     ctx->token = NULL;
     ctx->key = kstrdup("default-encryption-key-32bytes!", GFP_KERNEL);
+    ctx->rsize = VTFS_READAHEAD_SIZE;
 
     if (!ctx->host || !ctx->key) {
         kfree(ctx->host);
@@ -145,6 +156,10 @@ static void vtfs_put_super(struct super_block *sb)
     struct vtfs_sb_info *sbi = VTFS_SB(sb);
 
     if (sbi) {
+        if (sbi->flush_wq) {
+            flush_workqueue(sbi->flush_wq);
+            destroy_workqueue(sbi->flush_wq);
+        }
         vtfs_net_disconnect(sbi);
         vtfs_crypto_cleanup(sbi);
         kfree(sbi);
@@ -187,6 +202,7 @@ int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
     strncpy(sbi->server_host, ctx->host, sizeof(sbi->server_host) - 1);
     sbi->server_port = ctx->port;
+    sbi->readahead_size = ctx->rsize;
 
     if (ctx->token && ctx->token[0] != '\0') {
         strncpy(sbi->token, ctx->token, sizeof(sbi->token) - 1);
@@ -199,9 +215,17 @@ int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
     mutex_init(&sbi->net_lock);
     sbi->txn_counter = 0;
 
+    sbi->flush_wq = alloc_workqueue("vtfs_flush", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+    if (!sbi->flush_wq) {
+        VTFS_ERR("Failed to create flush workqueue");
+        kfree(sbi);
+        return -ENOMEM;
+    }
+
     ret = vtfs_crypto_init(sbi);
     if (ret < 0) {
         VTFS_ERR("Failed to initialize crypto: %d", ret);
+        destroy_workqueue(sbi->flush_wq);
         kfree(sbi);
         return ret;
     }
@@ -217,6 +241,7 @@ int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
     ret = vtfs_net_init(sbi);
     if (ret < 0) {
         VTFS_ERR("Failed to connect to server: %d", ret);
+        destroy_workqueue(sbi->flush_wq);
         vtfs_crypto_cleanup(sbi);
         kfree(sbi);
         sb->s_fs_info = NULL;
@@ -227,6 +252,7 @@ int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
     if (IS_ERR(root_inode)) {
         ret = PTR_ERR(root_inode);
         VTFS_ERR("Failed to create root inode: %d", ret);
+        destroy_workqueue(sbi->flush_wq);
         vtfs_net_disconnect(sbi);
         vtfs_crypto_cleanup(sbi);
         kfree(sbi);
@@ -237,6 +263,7 @@ int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
     sb->s_root = d_make_root(root_inode);
     if (!sb->s_root) {
         VTFS_ERR("Failed to create root dentry");
+        destroy_workqueue(sbi->flush_wq);
         vtfs_net_disconnect(sbi);
         vtfs_crypto_cleanup(sbi);
         kfree(sbi);
@@ -244,8 +271,8 @@ int vtfs_fill_super(struct super_block *sb, struct fs_context *fc)
         return -ENOMEM;
     }
 
-    VTFS_LOG("Mounted filesystem from %s:%d (readonly=%d)",
-             sbi->server_host, sbi->server_port, sbi->readonly);
+    VTFS_LOG("Mounted filesystem from %s:%d (readonly=%d, rsize=%zu)",
+             sbi->server_host, sbi->server_port, sbi->readonly, sbi->readahead_size);
     return 0;
 }
 

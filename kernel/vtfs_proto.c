@@ -1,7 +1,8 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/slab.h>
-#include <linux/unaligned.h>   /* get_unaligned_leXX / put_unaligned_leXX */
+#include <linux/highmem.h>
+#include <linux/unaligned.h>
 #include "vtfs.h"
 
 #define PROTO_BUF_SIZE 65536
@@ -385,25 +386,25 @@ ssize_t vtfs_proto_read(struct vtfs_sb_info *sbi, u64 ino, char *buf,
     put_unaligned_le64(offset, req);
     put_unaligned_le32(len, req + 8);
 
-    resp = kmalloc(8 + len, GFP_KERNEL);
+    resp = kvmalloc(8 + len, GFP_KERNEL);
     if (!resp)
         return -ENOMEM;
 
     resp_len = 8 + len;
     ret = vtfs_send_request(sbi, VTFS_OP_READ, ino, req, sizeof(req), resp, &resp_len);
     if (ret < 0) {
-        kfree(resp);
+        kvfree(resp);
         return ret;
     }
 
     if (resp_len < 8) {
-        kfree(resp);
+        kvfree(resp);
         return -EIO;
     }
 
     err = (int32_t)get_unaligned_le32(resp);
     if (err != 0) {
-        kfree(resp);
+        kvfree(resp);
         return err;
     }
 
@@ -412,12 +413,12 @@ ssize_t vtfs_proto_read(struct vtfs_sb_info *sbi, u64 ino, char *buf,
         data_len = len;
 
     if (resp_len < 8 + data_len) {
-        kfree(resp);
+        kvfree(resp);
         return -EIO;
     }
 
     memcpy(buf, resp + 8, data_len);
-    kfree(resp);
+    kvfree(resp);
     return data_len;
 }
 
@@ -431,7 +432,7 @@ ssize_t vtfs_proto_write(struct vtfs_sb_info *sbi, u64 ino, const char *buf,
     int32_t err;
 
     req_len = 12 + len;
-    req = kmalloc(req_len, GFP_KERNEL);
+    req = kvmalloc(req_len, GFP_KERNEL);
     if (!req)
         return -ENOMEM;
 
@@ -441,7 +442,7 @@ ssize_t vtfs_proto_write(struct vtfs_sb_info *sbi, u64 ino, const char *buf,
 
     resp_len = sizeof(resp);
     ret = vtfs_send_request(sbi, VTFS_OP_WRITE, ino, req, req_len, resp, &resp_len);
-    kfree(req);
+    kvfree(req);
 
     if (ret < 0)
         return ret;
@@ -460,6 +461,73 @@ ssize_t vtfs_proto_write(struct vtfs_sb_info *sbi, u64 ino, const char *buf,
         *new_size = (loff_t)get_unaligned_le64(resp + 8);
 
     return (ssize_t)get_unaligned_le32(resp + 4);
+}
+
+ssize_t vtfs_proto_write_chunked(struct vtfs_sb_info *sbi, u64 ino,
+                                  struct vtfs_write_buffer *wb, loff_t *new_size)
+{
+    u8 *chunk_buf;
+    size_t total_written = 0;
+    loff_t current_offset;
+    size_t remaining;
+    int ret;
+
+    if (wb->len == 0)
+        return 0;
+
+    chunk_buf = kvmalloc(VTFS_WRITE_CHUNK_SIZE, GFP_KERNEL);
+    if (!chunk_buf)
+        return -ENOMEM;
+
+    current_offset = wb->offset;
+    remaining = wb->len;
+
+    while (remaining > 0) {
+        size_t chunk_size = min_t(size_t, remaining, VTFS_WRITE_CHUNK_SIZE);
+        size_t buf_offset = total_written;
+        size_t copied = 0;
+        loff_t chunk_new_size;
+        ssize_t written;
+
+        while (copied < chunk_size) {
+            unsigned int page_idx = (buf_offset + copied) / PAGE_SIZE;
+            unsigned int page_off = (buf_offset + copied) % PAGE_SIZE;
+            unsigned int to_copy = min_t(size_t, PAGE_SIZE - page_off, chunk_size - copied);
+            void *kaddr;
+
+            if (page_idx >= wb->nr_pages || !wb->pages[page_idx])
+                break;
+
+            kaddr = kmap_local_page(wb->pages[page_idx]);
+            memcpy(chunk_buf + copied, kaddr + page_off, to_copy);
+            kunmap_local(kaddr);
+
+            copied += to_copy;
+        }
+
+        if (copied == 0)
+            break;
+
+        written = vtfs_proto_write(sbi, ino, chunk_buf, copied,
+                                   current_offset, &chunk_new_size);
+        if (written < 0) {
+            kvfree(chunk_buf);
+            return written;
+        }
+
+        total_written += written;
+        current_offset += written;
+        remaining -= written;
+
+        if (new_size)
+            *new_size = chunk_new_size;
+
+        if (written < copied)
+            break;
+    }
+
+    kvfree(chunk_buf);
+    return total_written;
 }
 
 int vtfs_proto_truncate(struct vtfs_sb_info *sbi, u64 ino, loff_t size)
